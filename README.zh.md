@@ -4,10 +4,10 @@
 
 ---
 
-0.2.0 更新: 已验证适配 dsh@0.1.2
+0.2.0 更新: 已验证适配 dsh@0.1.5
 
 ```bash
-npx @deepseek-ai/dsh@0.1.2-rc.1 plugin --profile web add dsh-mcp-mgr@0.2.0
+npx @deepseek-ai/dsh@0.1.5-rc.2 plugin --profile web add dsh-mcp-mgr@0.2.0
 ```
 
 ---
