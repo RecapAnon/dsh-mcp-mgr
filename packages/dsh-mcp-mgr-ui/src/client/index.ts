@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from 'dsh-mcp-mgr/remote'
@@ -93,8 +94,10 @@ export async function apply(ctx: ClientContext): Promise<void> {
   // Strict mode mounts only the selected workspace's servers: report the
   // workspace of the currently open session whenever it (or the workspace
   // list) changes. Non-strict host ignores the push.
+  const currentSession = () => Object.values(ctx.sessions.list.getSnapshot().byId)
+    .find(row => (row.retainedBy.mainView ?? 0) > 0)?.id
   const pushActiveWorkspace = (): void => {
-    const current = ctx.sessions.list.getSnapshot().current
+    const current = currentSession()
     const items = ctx.workspaces.list.getSnapshot().items
     const active = current === undefined
       ? undefined
@@ -155,7 +158,7 @@ export async function apply(ctx: ClientContext): Promise<void> {
       title: workspace.title,
     })),
     currentWorkspacePath: () => {
-      const current = ctx.sessions.list.getSnapshot().current
+      const current = currentSession()
       if (current === undefined) return ''
       return ctx.workspaces.list.getSnapshot().items
         .find(workspace => workspace.sessionIds.includes(current))?.path ?? ''
