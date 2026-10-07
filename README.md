@@ -4,10 +4,10 @@ English | [中文](README.zh.md)
 
 ---
 
-0.2.0 Update: Has been verified to be compatible with dsh@0.1.5
+0.3.0 Update: Has been verified to be compatible with dsh@0.2.0-rc.2
 
 ```bash
-npx @deepseek-ai/dsh@0.1.5-rc.2 plugin --profile web add dsh-mcp-mgr@0.2.0
+npx @deepseek-ai/dsh@0.2.0-rc.2 plugin --profile web add dsh-mcp-mgr@0.3.0
 ```
 
 ---

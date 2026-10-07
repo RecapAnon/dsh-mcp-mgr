@@ -13,7 +13,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 // The mcp-client plugin object; dynamically mounted one instance per server.
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
-import { scopeOf } from '@deepseek-ai/dsh-scope'
+import { scopeOf, type ScopeKey } from '@deepseek-ai/dsh-scope'
 import { chmodSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
@@ -476,7 +476,7 @@ function serverHasTools(ctx: unknown, serverName: string): boolean {
   // ctx.get, never property access: un-injected service properties throw
   // under Cordis's inject guard, and `tools` is an optional probe here.
   const tools = (ctx as { get?: (name: string) => unknown }).get?.('tools') as
-    | { schemas(scope?: string | undefined): readonly { name: string }[] }
+    | { schemas(scope?: ScopeKey): readonly { name: string }[] }
     | undefined
   if (tools === undefined) return false
   const prefix = `mcp__${serverName}__`

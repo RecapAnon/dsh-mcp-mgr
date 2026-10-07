@@ -96,13 +96,17 @@ export async function apply(ctx: ClientContext): Promise<void> {
   // list) changes. Non-strict host ignores the push.
   const currentSession = () => Object.values(ctx.sessions.list.getSnapshot().byId)
     .find(row => (row.retainedBy.mainView ?? 0) > 0)?.id
+  let lastPushed: string | undefined
   const pushActiveWorkspace = (): void => {
     const current = currentSession()
     const items = ctx.workspaces.list.getSnapshot().items
     const active = current === undefined
       ? undefined
       : items.find(workspace => workspace.sessionIds.includes(current))
-    void setActiveWorkspace(active?.path ?? '').catch((reason: unknown) => {
+    const path = active?.path ?? ''
+    if (path === lastPushed) return
+    lastPushed = path
+    void setActiveWorkspace(path).catch((reason: unknown) => {
       console.warn('mcp-mgr: active-workspace push failed:', reason)
     })
   }

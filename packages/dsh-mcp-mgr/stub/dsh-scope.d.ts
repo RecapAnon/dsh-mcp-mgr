@@ -6,6 +6,7 @@
  * the Typert analysis program never drags the real d.ts chain in.
  */
 declare module '@deepseek-ai/dsh-scope' {
+  export type ScopeKey = object
   /** Read the nearest scope tag inherited by a context. */
-  export function scopeOf(ctx: unknown): string | undefined
+  export function scopeOf(ctx: unknown): ScopeKey | undefined
 }
