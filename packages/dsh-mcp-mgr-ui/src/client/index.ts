@@ -107,6 +107,7 @@ export async function apply(ctx: ClientContext): Promise<void> {
     if (path === lastPushed) return
     lastPushed = path
     void setActiveWorkspace(path).catch((reason: unknown) => {
+      if (lastPushed === path) lastPushed = undefined
       console.warn('mcp-mgr: active-workspace push failed:', reason)
     })
   }
