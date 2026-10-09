@@ -30,20 +30,19 @@ export interface LoaderEntryView {
 }
 
 /**
- * serverNames currently reserved by LIVE profile-level mcp-client instances.
- * The loader mounts these outside dsh-mcp-mgr, so mcp-client's own global
- * uniqueness check rejects any workspace instance mounting the same name —
- * surfaces the reservation so workspace rows flag conflict instead of failing.
+ * serverNames of LIVE profile-level mcp-client instances, mapped to their
+ * loader entry id. Their tools are global, so a workspace server with the same
+ * name would shadow them: such workspace rows are `conflict` and never mount.
  */
-export function profileServerNames(entries: readonly LoaderEntryView[]): Set<string> {
-  const names = new Set<string>()
+export function profileServerNames(entries: readonly LoaderEntryView[]): Map<string, string> {
+  const names = new Map<string, string>()
   for (const entry of entries) {
     const options = entry.options ?? {}
     if (options.disabled === true) continue
     if (!MCP_CLIENT_ENTRY_NAMES.has(String(options.name))) continue
     const name = options.config?.serverName
     if (name === undefined) continue
-    if (entry.fiber?.state === FIBER_ACTIVE) names.add(name)
+    if (entry.fiber?.state === FIBER_ACTIVE) names.set(name, String(options.id ?? entry.id))
   }
   return names
 }

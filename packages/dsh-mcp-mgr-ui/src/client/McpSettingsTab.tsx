@@ -6,16 +6,6 @@ import { McpServerForm } from './McpServerForm.tsx'
 import type { McpLocaleKey } from './locales.ts'
 import css from './McpSettingsTab.module.css'
 
-/** localStorage key for the strict-mode checkbox. */
-export const STRICT_MODE_KEY = 'dsh.mcpMgr.strictMode'
-
-/** Persisted strict-mode preference; null when never set (host default applies). */
-export function loadStrictMode(): boolean | null {
-  const stored = localStorage.getItem(STRICT_MODE_KEY)
-  if (stored === null) return null
-  return stored === '1'
-}
-
 /** One workspace row the add-form may target. */
 export interface WorkspaceOption {
   readonly path: string
@@ -32,8 +22,6 @@ export interface McpSettingsTabInjected {
   removeServer: (workspace: string, name: string) => Promise<McpApplyResult>
   /** Enable/disable one server in a workspace's mcp.json. */
   setServerEnabled: (workspace: string, name: string, enabled: boolean) => Promise<McpApplyResult>
-  /** Toggle strict mode host-side; resolves with the post-change snapshot. */
-  setStrictMode: (enabled: boolean) => Promise<McpManagerSnapshot>
   /** Self-update check result (startup npm lookup). */
   versionInfo: () => Promise<McpPluginVersionInfo>
   /** Registered workspaces for the add-form target picker. */
@@ -53,27 +41,14 @@ type ViewState =
   | { readonly status: 'error' }
   | { readonly status: 'ready'; readonly snapshot: McpManagerSnapshot }
 
-/** Badge label key for one display status (raw status + connectivity derivation). */
-const DISPLAY_KEYS = {
-  connected: 'connected',
-  registered: 'active',
-  connecting: 'connecting',
+/** Badge label key per row status. */
+const STATUS_KEYS = {
   active: 'active',
   error: 'errorStatus',
   conflict: 'conflict',
-  removing: 'removing',
   configured: 'configured',
   disabled: 'disabled',
-} satisfies Record<DisplayStatus, McpLocaleKey>
-
-/** Display status: an 'active' row reports real connectivity when probed. */
-type DisplayStatus = 'connected' | 'registered' | McpServerStatus
-
-function displayStatus(server: McpServerState): DisplayStatus {
-  return server.status === 'active'
-    ? (server.connected === true ? 'connected' : 'registered')
-    : server.status
-}
+} satisfies Record<McpServerStatus, McpLocaleKey>
 
 /**
  * Short display form of a source path: last path segment by default, last two
@@ -88,7 +63,7 @@ function shortPath(path: string, forceLastTwo = false): string {
 
 /** Render the currently registered MCP servers (workspace + profile sources). */
 export function McpSettingsTab({
-  snapshot, apply, removeServer, setServerEnabled, setStrictMode, versionInfo, listWorkspaces, currentWorkspacePath, t,
+  snapshot, apply, removeServer, setServerEnabled, versionInfo, listWorkspaces, currentWorkspacePath, t,
 }: McpSettingsTabProps): ReactNode {
   const [request, setRequest] = useState(0)
   const [state, setState] = useState<ViewState>({ status: 'loading' })
@@ -96,7 +71,6 @@ export function McpSettingsTab({
   const [busy, setBusy] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [updateInfo, setUpdateInfo] = useState<McpPluginVersionInfo | null>(null)
-  const [strictMode, setStrictModeState] = useState<boolean>(() => loadStrictMode() ?? false)
   const [showForm, setShowForm] = useState(false)
 
   useEffect(() => {
@@ -171,7 +145,7 @@ export function McpSettingsTab({
     setShowForm(false)
     setState({ status: 'loading' })
     setRequest(value => value + 1)
-    setNotice(strictMode ? t('addedStrict') : t('added'))
+    setNotice(t('added'))
   }
 
   const onToggleEnabled = async (server: McpServerState, enabled: boolean): Promise<void> => {
@@ -192,19 +166,6 @@ export function McpSettingsTab({
     setNotice(result.ok ? (enabled ? t('enabled') : t('disabled')) : `${t('applyFailed')}: ${result.error}`)
   }
 
-  const onToggleStrict = async (enabled: boolean): Promise<void> => {
-    setStrictModeState(enabled)
-    localStorage.setItem(STRICT_MODE_KEY, enabled ? '1' : '0')
-    setNotice(null)
-    try {
-      const snapshot = await setStrictMode(enabled)
-      setState({ status: 'ready', snapshot })
-    } catch (error) {
-      setStrictModeState(!enabled)
-      setNotice(`${t('applyFailed')}: ${String(error instanceof Error ? error.message : error)}`)
-    }
-  }
-
   return (
     <div className={css.section} aria-busy={state.status === 'loading'}>
       {/* Transient result feedback: floats over the viewport, never pushes the table. */}
@@ -222,14 +183,6 @@ export function McpSettingsTab({
       <div className={css.heading}>
         <h3>{t('server')}</h3>
         <div className={css.headingActions}>
-          <label className={css.strictLabel} title={t('strictModeHint')}>
-            <input
-              type="checkbox"
-              checked={strictMode}
-              onChange={(event) => { void onToggleStrict(event.target.checked) }}
-            />
-            {t('strictMode')}
-          </label>
           <button
             type="button"
             className={css.add}
@@ -271,6 +224,7 @@ export function McpSettingsTab({
               <th>{t('server')}</th>
               <th>{t('transport')}</th>
               <th>{t('status')}</th>
+              <th title={t('agentsHint')}>{t('agents')}</th>
               <th>{t('action')}</th>
             </tr>
           </thead>
@@ -285,31 +239,23 @@ export function McpSettingsTab({
                       : null}
                   </td>
                   <td className={css.nowrapCell} title={server.name}>{server.name}</td>
-                  <td className={css.nowrapCell} title={server.transport}>{server.transport}</td>
+                  <td className={css.nowrapCell} title={server.transport}>{server.transport ?? ''}</td>
                   <td className={css.nowrapCell}>
-                    {(() => {
-                      const status = displayStatus(server)
-                      return (
-                        <>
-                          <span
-                            className={css.statusBadge}
-                            data-status={status}
-                            title={
-                              status === 'connected' ? t('connectedHint')
-                                : status === 'registered' ? t('activeHint')
-                                : undefined
-                            }
-                          >
-                            {t(DISPLAY_KEYS[status])}
-                          </span>
-                          {server.error !== undefined
-                            ? <span className={css.errorText} title={server.error}>{server.error}</span>
-                            : status === 'registered' && server.probeError !== undefined
-                              ? <span className={css.errorText} title={server.probeError}>{server.probeError}</span>
-                              : null}
-                        </>
-                      )
-                    })()}
+                    <span className={css.statusBadge} data-status={server.status}>
+                      {t(STATUS_KEYS[server.status])}
+                    </span>
+                    {(server.error ?? server.lastError) !== undefined ? (
+                      <span className={css.errorText} title={server.error ?? server.lastError}>
+                        {server.error ?? server.lastError}
+                      </span>
+                    ) : null}
+                  </td>
+                  <td className={css.nowrapCell}>
+                    {server.source === 'workspace' ? (
+                      <span title={t('agentsHint')}>
+                        {`${t('liveAgents')} ${server.liveAgents ?? 0} · ${t('connectedAgents')} ${server.connectedAgents ?? 0}`}
+                      </span>
+                    ) : null}
                   </td>
                   <td className={css.nowrapCell}>
                     {server.source === 'workspace' ? (

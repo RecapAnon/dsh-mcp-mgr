@@ -13,11 +13,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from 'dsh-mcp-mgr/remote'
 import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServerDraft } from 'dsh-mcp-mgr/types'
-import { loadStrictMode, McpSettingsTab, type McpSettingsTabInjected } from './McpSettingsTab.tsx'
+import { McpSettingsTab, type McpSettingsTabInjected } from './McpSettingsTab.tsx'
 import { en, zh, type McpLocaleKey } from './locales.ts'
 
 export type { McpSettingsTabInjected, McpSettingsTabProps } from './McpSettingsTab.tsx'
-export { STRICT_MODE_KEY, loadStrictMode } from './McpSettingsTab.tsx'
 export type { McpLocaleKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -39,8 +38,6 @@ interface McpMgrNamespace {
   apply(draft: McpServerDraft): Promise<RemoteResult<McpApplyResult>>
   removeServer(workspace: string, name: string): Promise<RemoteResult<McpApplyResult>>
   setServerEnabled(workspace: string, name: string, enabled: boolean): Promise<RemoteResult<McpApplyResult>>
-  setStrictMode(enabled: boolean): Promise<RemoteResult<McpManagerSnapshot>>
-  setActiveWorkspace(path: string): Promise<RemoteResult<McpManagerSnapshot>>
   versionInfo(): Promise<RemoteResult<McpPluginVersionInfo>>
 }
 
@@ -69,57 +66,8 @@ export async function apply(ctx: ClientContext): Promise<void> {
     return namespace
   }
 
-  const setStrictMode = async (enabled: boolean): Promise<McpManagerSnapshot> => {
-    const result = await mcpMgr().setStrictMode(enabled)
-    if (!result.ok) {
-      throw new Error(`mcpMgr.setStrictMode failed: ${result.error.code}: ${result.error.message}`)
-    }
-    return result.value
-  }
-  const setActiveWorkspace = async (path: string): Promise<void> => {
-    const result = await mcpMgr().setActiveWorkspace(path)
-    if (!result.ok) {
-      throw new Error(`mcpMgr.setActiveWorkspace failed: ${result.error.code}: ${result.error.message}`)
-    }
-  }
-
-  // Replay the persisted strict-mode preference once the remote is mounted.
-  const storedStrict = loadStrictMode()
-  if (storedStrict !== null) {
-    void setStrictMode(storedStrict).catch((reason: unknown) => {
-      console.warn('mcp-mgr: strict-mode replay failed:', reason)
-    })
-  }
-
-  // Strict mode mounts only the selected workspace's servers: report the
-  // workspace of the currently open session whenever it (or the workspace
-  // list) changes. Non-strict host ignores the push.
   const currentSession = () => Object.values(ctx.sessions.list.getSnapshot().byId)
     .find(row => (row.retainedBy.mainView ?? 0) > 0)?.id
-  let lastPushed: string | undefined
-  const pushActiveWorkspace = (): void => {
-    const current = currentSession()
-    const items = ctx.workspaces.list.getSnapshot().items
-    const active = current === undefined
-      ? undefined
-      : items.find(workspace => workspace.sessionIds.includes(current))
-    const path = active?.path ?? ''
-    if (path === lastPushed) return
-    lastPushed = path
-    void setActiveWorkspace(path).catch((reason: unknown) => {
-      if (lastPushed === path) lastPushed = undefined
-      console.warn('mcp-mgr: active-workspace push failed:', reason)
-    })
-  }
-  ctx.effect(() => {
-    const unsubscribeSessions = ctx.sessions.list.subscribe(pushActiveWorkspace)
-    const unsubscribeWorkspaces = ctx.workspaces.list.subscribe(pushActiveWorkspace)
-    pushActiveWorkspace()
-    return () => {
-      unsubscribeSessions()
-      unsubscribeWorkspaces()
-    }
-  }, 'dsh-mcp-mgr-ui: active workspace watch')
 
   const injected = (): McpSettingsTabInjected => ({
     snapshot: async () => {
@@ -150,7 +98,6 @@ export async function apply(ctx: ClientContext): Promise<void> {
       }
       return result.value
     },
-    setStrictMode,
     versionInfo: async () => {
       const result = await mcpMgr().versionInfo()
       if (!result.ok) {

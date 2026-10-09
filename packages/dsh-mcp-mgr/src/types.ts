@@ -6,37 +6,39 @@
 /** Where one MCP server registration comes from. */
 export type McpServerSource = 'workspace' | 'profile'
 
-/** Model-visible lifecycle status of one dynamically registered MCP server. */
+/**
+ * Row status. Workspace rows carry the config status (`configured`,
+ * `disabled`, `conflict`, `error`); profile rows report their fiber
+ * (`active`, `error`, `configured`) or `conflict`.
+ */
 export type McpServerStatus =
-  | 'connecting'
   | 'active'
   | 'error'
   | 'conflict'
-  | 'removing'
   | 'configured'
   | 'disabled'
 
-/** One dynamically registered MCP server as seen by the UI. */
+/** One MCP server row as seen by the UI. */
 export interface McpServerState {
-  /** Stable instance key: `<workspacePath>#<serverName>` for workspace rows, `profile#<entryId>` for profile rows. */
+  /** Stable row key: `<workspacePath>#<serverName>` for workspace rows, `profile#<entryId>` for profile rows. */
   readonly key: string
   /** Registration origin: workspace mcp.json or a profile-level config entry. */
   readonly source: McpServerSource
   /** serverName namespace (also the mcp.json entry name). */
   readonly name: string
-  readonly transport: 'stdio' | 'streamable-http'
+  /** Absent on workspace rows whose entry failed to parse. */
+  readonly transport?: 'stdio' | 'streamable-http'
   /** Workspace rows only: false when the mcp.json entry is disabled (`enabled: false`). */
   readonly enabled?: boolean
   readonly status: McpServerStatus
-  /** Human-readable failure text when status is error/conflict. */
+  /** Why the row is `error` / `conflict`. */
   readonly error?: string
-  /**
-   * Workspace instances only: whether real connectivity was probed at mount
-   * (the server's tools are registered). Absent for profile rows.
-   */
-  readonly connected?: boolean
-  /** Why the connectivity probe could not run/complete (workspace rows only). */
-  readonly probeError?: string
+  /** Workspace rows only: agents that currently hold a mount of this server. */
+  readonly liveAgents?: number
+  /** Workspace rows only: agents whose tool view contains `mcp__<name>__*`. */
+  readonly connectedAgents?: number
+  /** Workspace rows only: latest mount failure. */
+  readonly lastError?: string
   /** Workspace source only: directory that contributed this server. */
   readonly workspace?: string
   /** Profile source only: config file declaring the entry. */
@@ -60,10 +62,6 @@ export interface McpManagerSnapshot {
   readonly servers: readonly McpServerState[]
   /** Workspace directories currently being discovered. */
   readonly watchedWorkspaces: readonly string[]
-  /** Strict mode: only the active workspace's servers are mounted. */
-  readonly strictMode: boolean
-  /** Strict-mode target: the workspace the web client currently has selected ('' when none). */
-  readonly activeWorkspace: string
 }
 
 /** One server entry for create/update through the Remote. */

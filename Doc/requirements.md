@@ -15,7 +15,7 @@ dsh 目前的 MCP 接入只有一条路径：`@deepseek-ai/dsh-mcp-client` 插�
 
 ```
 packages/dsh-mcp-mgr/      组1 host 插件（已实现 + 验证）
-  src/{index,parse,sync,discovery,watch,types}.ts
+  src/{index,parse,mounts,discovery,profile,watch,version,types}.ts
   lib/typert.{host,remote-client}.js    Remote 产物（mcpMgr: snapshot/apply/remove）
 packages/dsh-mcp-mgr-ui/   组2 client 插件（已实现 + 构建）
   src/{index.ts, client/{index.ts,McpSettingsTab.tsx,locales.ts}}
@@ -25,43 +25,51 @@ packages/{platform,tsdown.client}.ts   client 构建基础设施（从 dsh 复�
 gen.mjs / verify.mjs / e2e/   生成 + 单测 + 真实 MCP server 端到端
 ```
 
-- **验证覆盖**：解析/${VAR}展开/拒绝路径；sync 生命周期（创建/重建/删除/冲突/失败/工作区移除）；Remote 产物 strict codec + 真实 Typert registry 挂载；**真实 mcp-client + 真实 stdio MCP server 端到端**（`e2e/e2e.mjs`，连接→active→mcp.json 变更→重建）
-- **已知未验证**：真实 dsh web profile 中的 UI 渲染与 roster 加载仍需人工确认；组 1 在 web profile 下经 workspaceRegistry 的多工作区并集（e2e 主要覆盖 headless cwd 路径）
+- **验证覆盖**：解析/${VAR}展开/拒绝路径；按 agent 挂载生命周期（`verify.mjs`，假 host：懒挂载、等待预算与中止、空闲停止、配置变更、冲突、挂载失败、并发；工作区解析含 headless/symlink/大小写）；Remote 产物 strict codec + 真实 Typert registry 挂载；**真实 mcp-client + 真实 stdio MCP server 端到端**（`e2e/e2e.mjs`：双工作区隔离、首个组装含工具、子 agent、空闲停止、mcp.json 变更、进程退出）
+- **已知未验证**：真实 dsh web profile 中的 UI 渲染与 roster 加载仍需人工确认；真实 workspaceRegistry 下的按 agent 工作区解析（e2e 使用假 registry）
 - **已验证**：本地 source profile 在隔离 `DSH_HOME` 下完成 add、bundle reconciliation、remove；源码 CLI 与本仓库 checkout 不要求固定目录
 - 构建命令（均从仓库根目录执行）：`pnpm run check`（build + verify）；生成器和回归使用正式 npm 包，不依赖 deepseek-harness 源码路径
 
 ## 总体设计
 
+> 2026-10-07 起以 [ADR-0001](<adr/0001-agent-scoped-lazy-workspace-mcp-mounts.md>) 为准（accepted，2026-10-08 修订：去掉 M1/E2，已按修订实现）：按 agent 懒挂载、空闲停止、移除严格模式。
+
 ```
 mcp.json (每个工作区 .dsh/dshmm/)
-    │ 发现（启动全量 + watch + 周期重扫）
+    │ 发现（启动全量 + watch + 周期重扫）→ 仅解析/缓存，不挂载
     ▼
 mcp-mgr host 插件 (组1)
-    │ 解析/校验/映射
-    ├─ ctx.plugin(mcp-client, config)  → Fiber  每个 server 一个实例
-    │ 增删改时 dispose 旧 Fiber / 挂新 Fiber
+    │ agent 首个 turn（system-prompt/assemble）按 session cwd 解析所属工作区
+    │ 挂载全部启用且非 conflict 的 server（无 preset 逻辑）；单次活动（running → idle）挂载等待共用 agentMountWaitMs（默认 30 秒），turn 中止即停止等待
+    ├─ createScope(pluginCtx, agent) + ctx.plugin(mcp-client, config)  每 agent × server 一个实例
+    │ 空闲 agentIdleTimeoutMs（默认 15 分钟）停止，下个 turn 重挂
     ▼
-ctx.tools (host 全局)  ← 所有 session 可见
+agent 自有 scope 的 tools/resources/instructions  ← 仅该 agent 可见
 
-组2 web UI: slots 注册 settings 分区 tab → 经通道读写组1状态
+组2 web UI: 展示各工作区配置状态 + 活跃/已连接 agent 数
 ```
 
 ## 关键决策（已定）
 
 | 决策 | 结论 |
 |---|---|
-| 工作区语义 | **并集**：注册所有已登记工作区的 mcp.json（headless 退化为 `process.cwd()` 单点） |
+| 工作区语义 | **按 agent 隔离**（ADR-0001，取代原"并集"）：agent 只挂载其 session `cwd`（realpath 精确等于已登记工作区）所属工作区的 mcp.json；无匹配则不挂载；无 registry（headless）时仅 `realpath.native(cwd)` 等于 `realpath.native(process.cwd())` 的 agent 获得该工作区 server；web profile 的 registry 尚未就绪时视为无工作区 |
+| 挂载时机 | 懒挂载：首个 turn 挂载，单次活动（running → idle）所有挂载等待（含重新组装）共用 30 秒上限（`agentMountWaitMs`，可配）并响应 turn 中止信号，空闲 15 分钟（`agentIdleTimeoutMs`，可配）停止；子 agent 同规则独立挂载 |
+| 严格模式 | **移除**（含 `activeWorkspace`、UI 开关与 localStorage 回放） |
+| 按 preset 屏蔽 | **零耦合**：本插件不含 preset 逻辑、不发事件，同一工作区所有 agent 获得相同 server；preset 级屏蔽由独立插件在调用时处理（E1）。被屏蔽 preset（如 orchestrator）仍可见工作区 MCP 工具且进程会启动。见 ADR-0001 |
+| 同名冲突 | 工作区 server 与 profile 级 server 同名：标 conflict，不挂载，UI 展示 |
 | 通道路线 | **通道①（自建 Typert Remote）可行**（S1 已验证，代价：vendor protocol 源码 + workspace 布局）；② settings 通道仍可作轻量备选 |
 | 格式映射 | `mcpServers` → mcp-client config 直译；支持 `${VAR}` env 展开；Claude `type: http` → `transport: streamable-http` |
 | stdio server cwd | **必须显式传工作区根路径**（`cwd:''` 会落到 host 进程目录，S3） |
 
 ## 机制限制（dsh 现状约束）
 
-1. **工具是 host 全局的**：`ctx.tools` 为 app 级，MCP 工具对全部 session 可见，无法按 session/工作区过滤 —— 这是并集方案的根因。
+1. **工具可按 agent 作用域注册，但自有作用域工具不受 `restrict` 约束**（0.2.0-rc.2 `core/tools` `view()`/`restrict()`）：按 agent 挂载可实现工作区隔离，preset 级 deny 无法隐藏这些工具，只能由 E1 guard 在调用时拒绝 —— 详见 ADR-0001。（原"工具是 host 全局的"结论已不成立。）
 2. **`workspaceRegistry` 无事件**：创建/删除工作区不发出任何事件，组 1 需自建同步兜底（watch 各工作区目录 + 周期重扫）。
 3. **mcp-client 不在 base bundle**：组 1 自行声明 `@deepseek-ai/dsh-mcp-client` 依赖即可，用户无需单独安装。
-4. **serverName 全局唯一**：不同工作区同名 server 会按 mcp-client 既有契约报错（不静默覆盖）；UI 需展示冲突状态。
-5. **headless 无 workspaceRegistry**：只能按 cwd 发现，多项目并存场景（如 host 进程内）不支持。
+4. **serverName 仅需在单个 mcp.json 内唯一**（ADR-0001）：mcp-client 按 scope 保留名称，不同工作区同名互不冲突；仅与 profile 级（全局）server 同名时标 conflict 且不挂载（防止自有工具静默遮蔽全局工具）。
+5. **headless 无 workspaceRegistry**：只能按 cwd 发现（agent cwd 须 realpath 等于 host cwd），多项目并存场景（如 host 进程内）不支持。
+6. **preset 卡片看不到工作区工具**（待定后续）：preset 工具访问设置卡片按全局注册表 + preset scope 列工具，agent 自有的工作区 MCP 工具不出现、无法勾选；需另找通用、零耦合、免手改的发现机制，见 ADR-0001。
 
 ## 待验证路线（spike 清单）
 
@@ -107,11 +115,11 @@ ctx.tools (host 全局)  ← 所有 session 可见
 ## 未来扩展（本期不做）
 
 - workspaceRegistry 事件（给 dsh 提 PR，消除周期重扫）
-- per-session 工具过滤（需 dsh 核心支持）
+- preset 卡片发现 agent 自有工作区工具（候选：观察 live agent 的 tools/change 并持久化已见 mcp__<server>__* 名单；经 cordis 插件注册表枚举 mcp-client fiber；DSH 宿主级特性/上游提案；未选定）
+- 自有作用域工具的 preset 级隐藏（需 dsh 核心支持 restrict 覆盖自有/后注册名称，ADR-0001 H1）
 - Resources / Prompts 桥接（mcp-client 本身未实现）
 - 非工作区来源 MCP 的写回管理（移除/编辑 profile patch 条目）
 - CLI 管理命令（`dsh mcp` 子命令）
-- 自定义 serverName 前缀策略（替代并集冲突报错）
 
 ## 非目标
 

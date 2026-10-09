@@ -150,7 +150,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
           env,
           cwd: asString(rawEntry.cwd) ?? workspacePath,
           toolCallTimeoutMs: 60_000,
-          failOnStartupError: false,
+          failOnStartupError: true,
         },
       })
     } else {
@@ -176,7 +176,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
           url,
           headers,
           toolCallTimeoutMs: 60_000,
-          failOnStartupError: false,
+          failOnStartupError: true,
         },
       })
     }

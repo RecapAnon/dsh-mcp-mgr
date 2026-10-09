@@ -2,34 +2,34 @@
  * dsh-mcp-mgr: workspace-level MCP manager for DeepSeek Harness.
  *
  * Discovers `.dsh/dshmm/mcp.json` under every registered workspace (or the
- * process cwd in headless), maps its `mcpServers` entries to
- * `@deepseek-ai/dsh-mcp-client` configs, and dynamically mounts one plugin
- * instance per server. File changes and periodic rescans keep the live set in
- * sync. A Typert Remote (`mcpMgr`) serves state and write-back to the web UI.
+ * process cwd in headless) and mounts its servers lazily per agent: at an
+ * agent's turn assembly, the enabled servers of its session's workspace run
+ * in an agent-keyed scope. A Typert Remote (`mcpMgr`) serves state and
+ * write-back to the web UI.
  * @module dsh-mcp-mgr
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
-// The mcp-client plugin object; dynamically mounted one instance per server.
+// The mcp-client plugin object; mounted once per agent and server.
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
-import { scopeOf, type ScopeKey } from '@deepseek-ai/dsh-scope'
-import { chmodSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createScope } from '@deepseek-ai/dsh-scope'
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
-import { collectWorkspaces, hasManagerFile } from './discovery.ts'
-import { draftToEntry, mcpJsonPath, parseMcpJson, SERVER_NAME_PATTERN, validateDraft, type ParsedServer } from './parse.ts'
+import { agentWorkspace, collectWorkspaces, hasManagerFile, nativeRealpath } from './discovery.ts'
+import { AgentMounts, type AgentScopeHandle } from './mounts.ts'
+import { draftToEntry, mcpJsonPath, parseMcpJson, SERVER_NAME_PATTERN, validateDraft, type ParsedServer, type ParseResult } from './parse.ts'
 import { profileServerNames, scanProfileEntries, type LoaderEntryView } from './profile.ts'
-import { McpSync } from './sync.ts'
 import { createFileWatcher } from './watch.ts'
 import { checkPluginVersion } from './version.ts'
 import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServerDraft, McpServerState } from './types.ts'
 
 export type * from './types.ts'
 export { parseMcpJson, mcpJsonPath, expandEnv } from './parse.ts'
-export { McpSync } from './sync.ts'
-export type { McpInstance, InstanceFactory } from './sync.ts'
+export { AgentMounts } from './mounts.ts'
+export type { AgentScopeHandle, MountHandle, MountsHost, MountsOptions } from './mounts.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-mgr'
@@ -46,12 +46,50 @@ export interface Config {
   enabled: boolean
   /** Periodic rescan interval covering workspaces added at runtime. */
   rescanIntervalMs: number
+  /** An agent's mounts stop after this long without a turn. */
+  agentIdleTimeoutMs: number
+  /** Total mount wait budget of one agent activity (turn). */
+  agentMountWaitMs: number
 }
+
+/** Largest delay `setTimeout` honours. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 export const Config: Schema<Config> = Schema.object({
   enabled: Schema.boolean().default(true),
   rescanIntervalMs: Schema.number().min(1000).max(3600_000).default(10_000),
+  agentIdleTimeoutMs: Schema.number().min(60_000).max(MAX_TIMER_DELAY_MS).default(900_000),
+  agentMountWaitMs: Schema.number().min(1000).max(MAX_TIMER_DELAY_MS).default(30_000),
 })
+
+/** The host Agent members read here. */
+interface AgentView {
+  readonly status?: string
+  readonly session?: { readonly header?: { readonly cwd?: string } }
+  readonly ctx: { effect(execute: () => () => Promise<void>, label?: string): () => unknown }
+}
+
+/** Assembly context fields of a turn assembly. */
+interface AssembleContextView {
+  readonly agent?: object
+  readonly signal?: AbortSignal
+}
+
+/** Host events subscribed here without depending on their packages' types. */
+interface HostEvents {
+  on(
+    name: 'system-prompt/assemble',
+    listener: (assembly: unknown, context: AssembleContextView | undefined, next: () => Promise<unknown>) => Promise<unknown>,
+    options: { prepend: boolean },
+  ): () => boolean
+  on(name: 'agent/status', listener: (payload: { agent: object; status: string }) => void): () => boolean
+}
+
+interface ToolsView {
+  schemas(scope?: object): readonly { name: string }[]
+}
+
+const EMPTY_PARSE: ParseResult = { servers: [], errors: [] }
 
 /** mcp-client plugin object passed to `ctx.plugin` per server. */
 const MCP_CLIENT_PLUGIN = {
@@ -61,27 +99,25 @@ const MCP_CLIENT_PLUGIN = {
 }
 
 /**
- * The manager service: owns discovery, sync, and the Remote surface.
- * `workspaceRegistry` is deliberately NOT injected — it is a web-only service
- * that appears asynchronously; discovery re-probes on every rescan.
+ * The manager service: owns discovery, per-agent mounts, and the Remote
+ * surface. `workspaceRegistry` is deliberately NOT injected — it is a web-only
+ * service that appears asynchronously; discovery re-probes on every rescan.
  */
 export class McpMgrGateway extends TypertRemoteService {
-  private readonly sync: McpSync
+  private readonly mounts: AgentMounts
   private readonly fileWatcher = createFileWatcher(
     (handler, ms) => setTimeout(handler, ms),
     handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
   )
   private readonly rescanTimer: ReturnType<typeof setInterval>
-  private readonly parseCache = new Map<string, readonly ParsedServer[]>()
+  private readonly parseCache = new Map<string, ParseResult>()
   private readonly workspaceSet = new Set<string>()
+  /** Nested assemblies issued to pick up fresh registrations, with their base assembly. */
+  private readonly reruns = new WeakMap<object, unknown>()
   /** Startup npm update check (fires once; never rejects). */
   private readonly versionCheck: Promise<McpPluginVersionInfo>
   private profileServers: readonly McpServerState[] = []
   private rescanning = false
-  /** Strict mode: only {@link activeWorkspace}'s servers are mounted. */
-  private strictMode = false
-  /** Workspace path the web client currently has selected; '' = none. */
-  private activeWorkspace = ''
   /** Serialized rescan chain so Remote-triggered passes apply in order. */
   private rescanChain: Promise<void> = Promise.resolve()
   /** Per-workspace lock for read-modify-write Remote mutations. */
@@ -89,38 +125,47 @@ export class McpMgrGateway extends TypertRemoteService {
 
   constructor(ctx: Context, config: Config) {
     super(ctx, 'mcpMgr')
-    this.sync = new McpSync(
-      {
-        create: async config => {
-          const fiber = await ctx.plugin(MCP_CLIENT_PLUGIN, config)
-          // Activation awaits the initial connect + tool discovery: tools
-          // registered under the server namespace prove real connectivity,
-          // while a failed connect activates with no tools. The probe must
-          // never reject create — a rejected create would leak the already
-          // activated fiber (its serverName stays held) and the next mount
-          // of the same name would fail as a duplicate. Any probe failure is
-          // surfaced on the row so a silent "registered" is explainable.
-          let connected = false
-          let probeError: string | undefined
-          const tools = (ctx as { get?: (name: string) => unknown }).get?.('tools')
-          if (tools === undefined) {
-            probeError = 'tools service not accessible'
-          } else {
-            try {
-              connected = serverHasTools(ctx, config.serverName)
-            } catch (error) {
-              probeError = String(error instanceof Error ? error.message : error)
-            }
-          }
-          if (probeError !== undefined) {
-            ctx.logger.warn(`mcp-mgr: connectivity probe failed for ${config.serverName}: ${probeError}`)
-          }
-          return { fiber, connected, ...(probeError === undefined ? {} : { probeError }) }
-        },
-        dispose: fiber => (fiber as { dispose(): Promise<void> }).dispose(),
+    this.mounts = new AgentMounts({
+      workspaceOf: agent => agentWorkspace(ctx, (agent as AgentView).session?.header?.cwd, this.workspaceSet),
+      candidates: workspace => this.candidates(workspace),
+      openScope: agent => openAgentScope(ctx, agent),
+      onAgentDispose: (agent, release) => {
+        try {
+          return (agent as AgentView).ctx.effect(() => release, 'mcp-mgr: agent mounts')
+        } catch {
+          return undefined
+        }
       },
-      { onChange: () => this.emitChange() },
-    )
+      isIdle: agent => (agent as AgentView).status !== 'running',
+      warn: message => { ctx.logger.warn(message) },
+    }, { idleTimeoutMs: config.agentIdleTimeoutMs, mountWaitMs: config.agentMountWaitMs })
+    const events = ctx as unknown as HostEvents
+    // Tools are frozen at assembly: mount before it completes. When
+    // registrations changed, a nested assembly yields a fresh base assembly
+    // that replaces this one before the chain continues.
+    events.on('system-prompt/assemble', async (assembly, context, next) => {
+      const agent = context?.agent
+      const signal = context?.signal
+      if (context === undefined || agent === undefined || signal === undefined) return next()
+      if (this.reruns.has(context)) {
+        this.reruns.set(context, assembly)
+        return assembly
+      }
+      const changed = await this.mounts.turn(agent, signal)
+      const systemPrompt = getService<{ assemble(context: object): Promise<unknown> }>(ctx, 'systemPrompt')
+      if (!changed || signal.aborted || systemPrompt === undefined || assembly === null || typeof assembly !== 'object') return next()
+      const rerun = { ...context }
+      this.reruns.set(rerun, undefined)
+      try {
+        await systemPrompt.assemble(rerun)
+        const fresh = this.reruns.get(rerun)
+        if (fresh !== null && typeof fresh === 'object') Object.assign(assembly, fresh)
+      } catch (error) {
+        ctx.logger.warn(`mcp-mgr: re-assembly failed: ${String(error instanceof Error ? error.message : error)}`)
+      }
+      return next()
+    }, { prepend: true })
+    events.on('agent/status', ({ agent, status }) => { this.mounts.status(agent, status) })
     this.rescanTimer = setInterval(() => {
       void this.runRescan()
     }, config.rescanIntervalMs)
@@ -136,7 +181,7 @@ export class McpMgrGateway extends TypertRemoteService {
     ctx.effect(() => async () => {
       this.fileWatcher.dispose()
       clearInterval(this.rescanTimer)
-      await this.sync.dispose()
+      await this.mounts.dispose()
     }, 'mcp-mgr: cleanup')
     void this.runRescan()
   }
@@ -155,45 +200,15 @@ export class McpMgrGateway extends TypertRemoteService {
   @Remote('snapshot')
   snapshot(): McpManagerSnapshot {
     return {
-      servers: [...this.sync.snapshot(), ...this.profileServers],
+      servers: [...this.workspaceRows(), ...this.profileServers],
       watchedWorkspaces: [...this.workspaceSet].sort(),
-      strictMode: this.strictMode,
-      activeWorkspace: this.activeWorkspace,
     }
-  }
-
-  /**
-   * Turn strict mode on/off and resync. Strict: only the active workspace's
-   * servers stay mounted. Non-strict: every workspace's servers mount (union).
-   * @param enabled - strict mode flag.
-   * @returns the post-resync snapshot.
-   */
-  @Remote('setStrictMode')
-  async setStrictMode(enabled: boolean): Promise<McpManagerSnapshot> {
-    this.strictMode = enabled
-    await this.runRescan()
-    return this.snapshot()
-  }
-
-  /**
-   * Report the web client's currently selected workspace ('' = none). Only
-   * strict mode reacts; non-strict keeps the union untouched.
-   * @param path - canonical workspace path, or '' for no selection.
-   * @returns the post-resync snapshot.
-   */
-  @Remote('setActiveWorkspace')
-  async setActiveWorkspace(path: string): Promise<McpManagerSnapshot> {
-    const activeWorkspace = path === '' ? '' : this.resolveRegisteredWorkspace(path)
-    if (activeWorkspace === undefined) throw new Error(`workspace is not registered: ${path}`)
-    this.activeWorkspace = activeWorkspace
-    if (this.strictMode) await this.runRescan()
-    return this.snapshot()
   }
 
   /**
    * Create one server entry in a workspace's mcp.json (file created when
    * absent). Resolves only after the resync settles, so a caller's follow-up
-   * snapshot already reflects the mounted state.
+   * snapshot already reflects the new entry.
    */
   @Remote('apply')
   async apply(draft: McpServerDraft): Promise<McpApplyResult> {
@@ -230,7 +245,7 @@ export class McpMgrGateway extends TypertRemoteService {
     } catch (error) {
       return { ok: false, error: `write failed: ${String(error instanceof Error ? error.message : error)}` }
     }
-    // A brand-new file is not watched yet: resync now so the entry mounts
+    // A brand-new file is not watched yet: resync now so the entry shows up
     // without waiting for the periodic rescan. The mutation invalidates the
     // parse cache, or this pass would re-sync the pre-write parse.
     this.parseCache.delete(workspacePath)
@@ -287,7 +302,7 @@ export class McpMgrGateway extends TypertRemoteService {
    * Enable or disable one server entry in a workspace's mcp.json. Disabling
    * writes `enabled: false`; enabling removes the field (absent = enabled).
    * Resolves only after the resync settles, so the caller's follow-up
-   * snapshot already reflects the mounted/unmounted state.
+   * snapshot already reflects the flag; disabling stops the server on every agent.
    */
   @Remote('setServerEnabled')
   async setServerEnabled(workspace: string, serverName: string, enabled: boolean): Promise<McpApplyResult> {
@@ -333,12 +348,8 @@ export class McpMgrGateway extends TypertRemoteService {
   }
 
   private resolveRegisteredWorkspace(input: string): string | undefined {
-    let candidate: string
-    try {
-      candidate = realpathSync(input)
-    } catch {
-      return undefined
-    }
+    const candidate = nativeRealpath(input)
+    if (candidate === undefined) return undefined
     return collectWorkspaces(this.ctx).some(workspace => workspace.path === candidate) ? candidate : undefined
   }
 
@@ -366,7 +377,7 @@ export class McpMgrGateway extends TypertRemoteService {
     return next
   }
 
-  /** One full discovery + sync pass. */
+  /** One full discovery pass: refresh parsed configs and apply removals to live mounts. */
   async rescan(): Promise<void> {
     if (this.rescanning) return
     this.rescanning = true
@@ -377,47 +388,28 @@ export class McpMgrGateway extends TypertRemoteService {
       for (const path of removed) {
         this.workspaceSet.delete(path)
         this.parseCache.delete(path)
-        await this.sync.removeWorkspace(path)
+        await this.mounts.workspaceRemoved(path)
       }
       const watchFiles: string[] = []
       for (const workspace of workspaces) {
         if (!hasManagerFile(workspace.path)) {
-          // A deleted mcp.json is an empty desired state, not an absent pass.
-          // Reconcile it immediately so the old MCP fiber and tools unload.
           this.parseCache.delete(workspace.path)
-          await this.sync.syncWorkspace({ workspacePath: workspace.path, servers: [] })
           continue
         }
         watchFiles.push(mcpJsonPath(workspace.path))
-        const cached = this.parseCache.get(workspace.path)
-        if (cached !== undefined) continue
-        this.parseCache.set(workspace.path, this.readWorkspace(workspace.path))
+        if (this.parseCache.has(workspace.path)) continue
+        this.parseCache.set(workspace.path, this.readWorkspace(workspace.path, true))
       }
       this.fileWatcher.setWatchFiles(watchFiles, () => {
         this.parseCache.clear()
         void this.runRescan()
       })
       for (const path of next) this.workspaceSet.add(path)
-      // Names live in profile-level mcp-client instances are unmountable:
-      // flag workspace rows conflict instead of failing the mount.
-      this.sync.setReservedNames(profileServerNames(this.loaderEntries()))
-      for (const path of [...next].sort()) {
-        const servers = this.parseCache.get(path) ?? []
-        // Strict mode mounts only the selected workspace; empty desires
-        // unmount every other workspace's instances (profile rows stay).
-        const desired = this.strictMode && path !== this.activeWorkspace ? [] : servers
-        await this.sync.syncWorkspace({ workspacePath: path, servers: desired })
-      }
-      // A server down at mount reconnects in the background; re-probe so its
-      // status flips to connected once the tools actually register.
-      this.sync.refreshConnectivity(name => {
-        try {
-          return serverHasTools(this.ctx, name)
-        } catch {
-          return false
-        }
-      })
-      this.profileServers = await this.scanProfileEntries()
+      // Removed, disabled or newly conflicting servers stop now on every
+      // agent; added or changed ones are picked up at each agent's next turn.
+      for (const path of [...next].sort()) await this.mounts.configChanged(path)
+      const conflicts = new Set(this.workspaceRows().filter(row => row.status === 'conflict').map(row => row.name))
+      this.profileServers = await scanProfileEntries(this.loaderEntries(), conflicts)
     } finally {
       this.rescanning = false
     }
@@ -425,37 +417,82 @@ export class McpMgrGateway extends TypertRemoteService {
 
   /** Loader entries when the loader service is mounted (web profile). */
   private loaderEntries(): readonly LoaderEntryView[] {
-    const loader = (this.ctx as { get?: (name: string) => unknown }).get?.('loader') as
-      | { entries(): readonly LoaderEntryView[] }
-      | undefined
-    return loader?.entries() ?? []
+    return getService<{ entries(): readonly LoaderEntryView[] }>(this.ctx, 'loader')?.entries() ?? []
   }
 
-  /**
-   * Project profile-level mcp-client registrations (cordis config tree: profile
-   * patches, bundles, --patch overlays) as read-only server rows.
-   */
-  private async scanProfileEntries(): Promise<McpServerState[]> {
-    return scanProfileEntries(this.loaderEntries(), new Set(this.sync.snapshot().map(server => server.name)))
+  private parsed(workspacePath: string): ParseResult {
+    return this.parseCache.get(workspacePath)
+      ?? (hasManagerFile(workspacePath) ? this.readWorkspace(workspacePath, false) : EMPTY_PARSE)
   }
 
-  private readWorkspace(workspacePath: string): readonly ParsedServer[] {
+  /** Enabled servers of a workspace not shadowed by a profile-level server, in mcp.json order. */
+  private candidates(workspacePath: string): readonly ParsedServer[] {
+    const reserved = profileServerNames(this.loaderEntries())
+    return this.parsed(workspacePath).servers.filter(server => server.enabled && !reserved.has(server.name))
+  }
+
+  private workspaceRows(): McpServerState[] {
+    const reserved = profileServerNames(this.loaderEntries())
+    const tools = getService<ToolsView>(this.ctx, 'tools')
+    const rows: McpServerState[] = []
+    for (const workspace of [...this.workspaceSet].sort()) {
+      const parsed = this.parseCache.get(workspace) ?? EMPTY_PARSE
+      const views = tools === undefined ? [] : this.mounts.agentsIn(workspace).map(agent => toolNames(tools, agent))
+      const workspaceRows: McpServerState[] = []
+      for (const server of parsed.servers) {
+        const owner = reserved.get(server.name)
+        const status = !server.enabled ? 'disabled' : owner !== undefined ? 'conflict' : 'configured'
+        const prefix = `mcp__${server.name}__`
+        const connectedAgents = status !== 'configured'
+          ? 0
+          : views.filter(names => names.some(name => name.startsWith(prefix))).length
+        const lastError = status === 'configured' ? this.mounts.lastError(workspace, server.name) : undefined
+        workspaceRows.push({
+          key: `${workspace}#${server.name}`,
+          source: 'workspace',
+          workspace,
+          name: server.name,
+          transport: server.config.transport,
+          enabled: server.enabled,
+          status,
+          ...(status === 'conflict' ? { error: `serverName "${server.name}" is already used by profile-level mcp-client entry "${owner}"` } : {}),
+          liveAgents: status === 'configured' ? this.mounts.liveAgents(workspace, server.name) : 0,
+          connectedAgents,
+          ...(lastError === undefined ? {} : { lastError }),
+        })
+      }
+      for (const error of parsed.errors) {
+        workspaceRows.push({
+          key: `${workspace}#${error.name}`,
+          source: 'workspace',
+          workspace,
+          name: error.name,
+          status: 'error',
+          error: error.message,
+          liveAgents: 0,
+          connectedAgents: 0,
+        })
+      }
+      rows.push(...workspaceRows.sort((left, right) => left.name.localeCompare(right.name)))
+    }
+    return rows
+  }
+
+  private readWorkspace(workspacePath: string, log: boolean): ParseResult {
     const path = mcpJsonPath(workspacePath)
     try {
       const parsed = parseMcpJson(readFileSync(path, 'utf8'), workspacePath)
-      for (const error of parsed.errors) {
-        this.ctx.logger.warn(`mcp-mgr: ${workspacePath}: ${error.name}: ${error.message}`)
+      if (log) {
+        for (const error of parsed.errors) {
+          this.ctx.logger.warn(`mcp-mgr: ${workspacePath}: ${error.name}: ${error.message}`)
+        }
       }
-      return parsed.servers
+      return parsed
     } catch (error) {
-      this.ctx.logger.warn(`mcp-mgr: cannot read ${path}: ${String(error instanceof Error ? error.message : error)}`)
-      return []
+      const message = String(error instanceof Error ? error.message : error)
+      if (log) this.ctx.logger.warn(`mcp-mgr: cannot read ${path}: ${message}`)
+      return { servers: [], errors: [{ name: '(document)', message: `cannot read mcp.json: ${message}` }] }
     }
-  }
-
-  private emitChange(): void {
-    // The client subscribes through the forwarded-event allowlist; no direct
-    // host-side delivery needed today (the UI polls snapshot on demand).
   }
 }
 
@@ -471,19 +508,44 @@ function atomicWriteJson(path: string, document: unknown): void {
   }
 }
 
-/** Whether the tools registry holds any `mcp__<serverName>__*` tool. */
-function serverHasTools(ctx: unknown, serverName: string): boolean {
-  // ctx.get, never property access: un-injected service properties throw
-  // under Cordis's inject guard, and `tools` is an optional probe here.
-  const tools = (ctx as { get?: (name: string) => unknown }).get?.('tools') as
-    | { schemas(scope?: ScopeKey): readonly { name: string }[] }
-    | undefined
-  if (tools === undefined) return false
-  const prefix = `mcp__${serverName}__`
-  // The gateway's own scope view: includes the global layer and every scope
-  // on the gateway's chain, so scoped registrations are visible too.
-  const names = tools.schemas(scopeOf(ctx))
-  return names.some(schema => schema.name.startsWith(prefix))
+/**
+ * Optional service lookup through `ctx.get`: un-injected service properties
+ * throw under Cordis's inject guard.
+ */
+function getService<T>(ctx: unknown, name: string): T | undefined {
+  return (ctx as { get?: (name: string) => unknown }).get?.(name) as T | undefined
+}
+
+function toolNames(tools: ToolsView, agent: object): string[] {
+  try {
+    return tools.schemas(agent).map(schema => schema.name)
+  } catch {
+    return []
+  }
+}
+
+/** An agent-keyed scope under the plugin context; disposed with the agent or the plugin. */
+function openAgentScope(ctx: Context, agent: object): AgentScopeHandle {
+  const scope = createScope(ctx, agent)
+  return {
+    mount: (config) => {
+      const fiber = scope.ctx.plugin(MCP_CLIENT_PLUGIN, config) as unknown as FiberView
+      return {
+        ready: fiber.await().then(() => undefined),
+        dispose: async () => {
+          await fiber.dispose()
+          while (fiber.inertia !== undefined) await fiber.inertia
+        },
+      }
+    },
+    dispose: () => scope.dispose(),
+  }
+}
+
+interface FiberView {
+  await(): Promise<unknown>
+  dispose(): unknown
+  readonly inertia?: Promise<unknown>
 }
 
 /**
