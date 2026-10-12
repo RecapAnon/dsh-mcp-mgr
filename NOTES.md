@@ -13,6 +13,7 @@
 
 ## 状态语义
 
+- profile 行：禁用的 mcp-client 条目也列出（`disabled`，不判 conflict）；启停走 `pluginManager.setPluginEnabled(loader entry.id)`，不自己改 YAML（bundle 行不在 profile 文件里，只能写覆盖行）；改完 host 代码须重启 dsh web
 - 工作区行 status 只表示配置：`configured` / `disabled` / `conflict`（与 profile 级同名）/ `error`（条目解析失败）
 - `liveAgents` = 持有该 server 挂载的 agent 数（含连接中）；`connectedAgents` = `tools.schemas(agent)` 含 `mcp__<name>__*` 的 agent 数，快照时每 agent 计算一次
 - `lastError`：该 server 最近一次挂载失败；成功、server 移除或工作区移除时清除

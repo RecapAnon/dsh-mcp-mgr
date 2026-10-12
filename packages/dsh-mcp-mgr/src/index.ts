@@ -21,7 +21,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { agentWorkspace, collectWorkspaces, hasManagerFile, nativeRealpath } from './discovery.ts'
 import { AgentMounts, type AgentScopeHandle } from './mounts.ts'
 import { draftToEntry, mcpJsonPath, parseMcpJson, SERVER_NAME_PATTERN, validateDraft, type ParsedServer, type ParseResult } from './parse.ts'
-import { profileServerNames, scanProfileEntries, type LoaderEntryView } from './profile.ts'
+import { changeOutcome, isMcpClientEntry, profileServerNames, scanProfileEntries, type LoaderEntryView, type PluginChangeView } from './profile.ts'
 import { createFileWatcher } from './watch.ts'
 import { checkPluginVersion } from './version.ts'
 import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServerDraft, McpServerState } from './types.ts'
@@ -347,6 +347,31 @@ export class McpMgrGateway extends TypertRemoteService {
     }
   }
 
+  /**
+   * Enable or disable one profile-level mcp-client entry through the host
+   * plugin manager, which persists a `disabled` override in the profile patch
+   * and applies it live. Resolves after the following rescan settles.
+   */
+  @Remote('setProfileServerEnabled')
+  async setProfileServerEnabled(entryId: string, enabled: boolean): Promise<McpApplyResult> {
+    const entry = this.loaderEntries().find(candidate => candidate.id === entryId)
+    if (entry === undefined || !isMcpClientEntry(entry)) {
+      return { ok: false, error: `not a profile MCP server entry: ${entryId}` }
+    }
+    const manager = getService<PluginManagerView>(this.ctx, 'pluginManager')
+    if (manager === undefined) {
+      return { ok: false, error: 'the host plugin manager is unavailable; edit the profile cordis.patch.yml instead' }
+    }
+    let result: PluginChangeView
+    try {
+      result = await manager.setPluginEnabled(entryId, enabled)
+    } catch (error) {
+      return { ok: false, error: String(error instanceof Error ? error.message : error) }
+    }
+    await this.runRescan()
+    return changeOutcome(result)
+  }
+
   private resolveRegisteredWorkspace(input: string): string | undefined {
     const candidate = nativeRealpath(input)
     if (candidate === undefined) return undefined
@@ -494,6 +519,11 @@ export class McpMgrGateway extends TypertRemoteService {
       return { servers: [], errors: [{ name: '(document)', message: `cannot read mcp.json: ${message}` }] }
     }
   }
+}
+
+/** Host plugin manager members used here. */
+interface PluginManagerView {
+  setPluginEnabled(id: string, enabled: boolean): Promise<PluginChangeView>
 }
 
 function atomicWriteJson(path: string, document: unknown): void {

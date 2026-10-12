@@ -1,14 +1,15 @@
 /**
  * Profile-level MCP server projection: scan the cordis config tree (profile
  * patches, bundles, --patch overlays) for mcp-client registrations and map
- * them to read-only server rows with real runtime status.
+ * them to server rows with real runtime status. Enablement is changed through
+ * the host plugin manager, never by editing patch files here.
  * @module dsh-mcp-mgr/profile
  */
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { McpServerState } from './types.ts'
+import type { McpApplyResult, McpServerState } from './types.ts'
 
 /** Cordis fiber states (numeric values mirror @deepseek-ai/cordis). */
 const FIBER_ACTIVE = 2
@@ -47,12 +48,17 @@ export function profileServerNames(entries: readonly LoaderEntryView[]): Map<str
   return names
 }
 
+/** Whether a loader entry is a profile-level mcp-client registration. */
+export function isMcpClientEntry(entry: LoaderEntryView): boolean {
+  return MCP_CLIENT_ENTRY_NAMES.has(String(entry.options?.name))
+}
+
 /**
- * Project profile-level mcp-client registrations as read-only server rows.
+ * Project profile-level mcp-client registrations as server rows.
  * Loader entries carry the resolved config and the live fiber, so status is
- * real: active fiber -> active, failed fiber -> error (e.g. duplicate
- * serverName), otherwise -> configured. Rows colliding with a workspace
- * serverName are flagged conflict.
+ * real: disabled entry -> disabled, active fiber -> active, failed fiber ->
+ * error (e.g. duplicate serverName), otherwise -> configured. Enabled rows
+ * colliding with a workspace serverName are flagged conflict.
  */
 export async function scanProfileEntries(
   entries: readonly LoaderEntryView[],
@@ -62,18 +68,18 @@ export async function scanProfileEntries(
   const rows: McpServerState[] = []
   for (const entry of entries) {
     const options = entry.options ?? {}
-    if (options.disabled === true) continue
-    if (!MCP_CLIENT_ENTRY_NAMES.has(String(options.name))) continue
+    if (!isMcpClientEntry(entry)) continue
     const config = options.config
     const name = config?.serverName
     if (name === undefined || config?.transport === undefined) continue
     // Prefer the raw yml id: the loader's `entry.id` getter prefixes parent
     // group ids, which never appear verbatim in the patch file.
-    const entryId = String(options.id ?? entry.id)
+    const rawId = String(options.id ?? entry.id)
+    const enabled = options.disabled !== true
     const fiber = entry.fiber
-    let status: McpServerState['status'] = 'configured'
+    let status: McpServerState['status'] = enabled ? 'configured' : 'disabled'
     let error: string | undefined
-    if (fiber !== undefined) {
+    if (enabled && fiber !== undefined) {
       if (fiber.state === FIBER_ACTIVE) status = 'active'
       else if (fiber.state === FIBER_FAILED) {
         status = 'error'
@@ -82,17 +88,19 @@ export async function scanProfileEntries(
         }
       }
     }
-    if (workspaceNames.has(name)) {
+    if (enabled && workspaceNames.has(name)) {
       status = 'conflict'
       error = `serverName "${name}" is also used by a workspace mcp.json`
     }
-    const sourceFile = findProfilePatchFile(entryId, profilesDir)
+    const sourceFile = findProfilePatchFile(rawId, profilesDir)
     rows.push({
-      key: `profile#${entryId}`,
+      key: `profile#${rawId}`,
       source: 'profile',
       name,
       transport: config.transport === 'stdio' ? 'stdio' : 'streamable-http',
+      enabled,
       status,
+      ...(entry.id === undefined ? {} : { entryId: entry.id }),
       ...(error === undefined ? {} : { error }),
       ...(sourceFile === undefined ? {} : { sourceFile }),
     })
@@ -127,6 +135,28 @@ export function findProfilePatchFile(entryId: string, profilesDir = defaultProfi
     }
   }
   return undefined
+}
+
+/** Fields of the host plugin manager's change result read here. */
+export interface PluginChangeView {
+  readonly application: string
+  readonly error?: { readonly code: string; readonly diagnostic?: string }
+}
+
+const MANAGEMENT_ERRORS: Readonly<Record<string, string>> = {
+  'unaddressable': 'this entry cannot be changed through the profile patch (declared inside a group or under a duplicate id)',
+  'management-required': 'this entry is required by plugin management and cannot be disabled',
+  'unknown-plugin': 'the plugin manager does not know this entry',
+}
+
+/** Map a plugin manager change result to the Remote result. */
+export function changeOutcome(result: PluginChangeView): McpApplyResult {
+  if (result.application === 'applied' && result.error === undefined) return { ok: true }
+  if (result.application === 'restart-required') return { ok: false, error: 'saved; restart dsh to apply' }
+  if (result.application === 'overridden') return { ok: false, error: 'saved, but a higher-priority patch overrides it' }
+  const error = result.error
+  if (error === undefined) return { ok: false, error: `plugin manager reported ${result.application}` }
+  return { ok: false, error: MANAGEMENT_ERRORS[error.code] ?? (error.diagnostic === undefined ? error.code : `${error.code}: ${error.diagnostic}`) }
 }
 
 function defaultProfilesDir(): string {

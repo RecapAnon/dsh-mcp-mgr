@@ -22,6 +22,8 @@ export interface McpSettingsTabInjected {
   removeServer: (workspace: string, name: string) => Promise<McpApplyResult>
   /** Enable/disable one server in a workspace's mcp.json. */
   setServerEnabled: (workspace: string, name: string, enabled: boolean) => Promise<McpApplyResult>
+  /** Enable/disable one profile-level server through the host plugin manager. */
+  setProfileServerEnabled: (entryId: string, enabled: boolean) => Promise<McpApplyResult>
   /** Self-update check result (startup npm lookup). */
   versionInfo: () => Promise<McpPluginVersionInfo>
   /** Registered workspaces for the add-form target picker. */
@@ -63,7 +65,7 @@ function shortPath(path: string, forceLastTwo = false): string {
 
 /** Render the currently registered MCP servers (workspace + profile sources). */
 export function McpSettingsTab({
-  snapshot, apply, removeServer, setServerEnabled, versionInfo, listWorkspaces, currentWorkspacePath, t,
+  snapshot, apply, removeServer, setServerEnabled, setProfileServerEnabled, versionInfo, listWorkspaces, currentWorkspacePath, t,
 }: McpSettingsTabProps): ReactNode {
   const [request, setRequest] = useState(0)
   const [state, setState] = useState<ViewState>({ status: 'loading' })
@@ -149,12 +151,16 @@ export function McpSettingsTab({
   }
 
   const onToggleEnabled = async (server: McpServerState, enabled: boolean): Promise<void> => {
-    if (server.workspace === undefined) return
+    const { workspace, entryId } = server
+    const toggle = server.source === 'workspace'
+      ? workspace === undefined ? undefined : () => setServerEnabled(workspace, server.name, enabled)
+      : entryId === undefined ? undefined : () => setProfileServerEnabled(entryId, enabled)
+    if (toggle === undefined) return
     setBusy(server.key)
     setNotice(null)
     let result: McpApplyResult
     try {
-      result = await setServerEnabled(server.workspace, server.name, enabled)
+      result = await toggle()
     } catch (error) {
       setBusy(null)
       setNotice(`${t('applyFailed')}: ${String(error instanceof Error ? error.message : error)}`)
@@ -277,6 +283,16 @@ export function McpSettingsTab({
                           {t('remove')}
                         </button>
                       </>
+                    ) : server.entryId !== undefined ? (
+                      <button
+                        type="button"
+                        className={css.toggle}
+                        disabled={busy === server.key}
+                        title={t('profileToggleHint')}
+                        onClick={() => { void onToggleEnabled(server, server.enabled === false) }}
+                      >
+                        {server.enabled === false ? t('enable') : t('disable')}
+                      </button>
                     ) : null}
                   </td>
                 </tr>

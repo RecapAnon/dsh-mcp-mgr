@@ -82,6 +82,7 @@ Rules:
 - Every agent of a workspace gets all its enabled, non-conflict servers; there is no per-preset filtering.
 - Compatibility: requires `dsh-preset-tool-access` **>= 0.2.1** (earlier versions' `restrict` throws on agent-scoped tool names and drops their denials).
 - Settings shows per workspace server: config status (`configured` / `disabled` / `conflict` / `error`), running agents, connected agents (tools visible), and the last error.
+- Profile-level servers (mcp-client rows from bundles or the profile `cordis.patch.yml`) can be disabled and re-enabled in Settings. The change goes through the host plugin manager, which writes a `disabled` override into the profile `cordis.patch.yml` and applies it live to every session. Rows the plugin manager cannot address (inside a group, duplicate id) report why.
 - On Windows, prefer launching stdio servers with `node` directly: teardown kills only the direct child, so `cmd /c npx …` wrappers can leave orphaned processes.
 
 ### Plugin configuration

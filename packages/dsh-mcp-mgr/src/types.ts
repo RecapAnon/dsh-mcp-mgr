@@ -8,8 +8,8 @@ export type McpServerSource = 'workspace' | 'profile'
 
 /**
  * Row status. Workspace rows carry the config status (`configured`,
- * `disabled`, `conflict`, `error`); profile rows report their fiber
- * (`active`, `error`, `configured`) or `conflict`.
+ * `disabled`, `conflict`, `error`); profile rows report `disabled`, their
+ * fiber (`active`, `error`, `configured`) or `conflict`.
  */
 export type McpServerStatus =
   | 'active'
@@ -28,8 +28,10 @@ export interface McpServerState {
   readonly name: string
   /** Absent on workspace rows whose entry failed to parse. */
   readonly transport?: 'stdio' | 'streamable-http'
-  /** Workspace rows only: false when the mcp.json entry is disabled (`enabled: false`). */
+  /** False when the mcp.json entry (`enabled: false`) or the profile loader entry (`disabled: true`) is disabled. */
   readonly enabled?: boolean
+  /** Profile rows only: loader entry id passed to `setProfileServerEnabled`. */
+  readonly entryId?: string
   readonly status: McpServerStatus
   /** Why the row is `error` / `conflict`. */
   readonly error?: string

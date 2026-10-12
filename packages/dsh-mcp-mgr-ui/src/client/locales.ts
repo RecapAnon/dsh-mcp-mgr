@@ -56,6 +56,7 @@ export const zh = {
   added: '已写入 mcp.json',
   updateAvailable: '插件有新版本可用，点击',
   updateAvailableLink: '查看升级方式',
+  profileToggleHint: '通过宿主插件管理器写入 profile 的 cordis.patch.yml 并立即生效（所有会话）',
 } satisfies Record<string, string>
 
 /** MCP manager locale key union. */
@@ -117,4 +118,5 @@ export const en: Record<McpLocaleKey, string> = {
   added: 'Written to mcp.json',
   updateAvailable: 'A new plugin version is available. Click',
   updateAvailableLink: 'to see how to upgrade.',
+  profileToggleHint: 'Saved to the profile cordis.patch.yml through the host plugin manager and applied immediately (all sessions)',
 }

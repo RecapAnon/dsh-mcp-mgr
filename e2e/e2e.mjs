@@ -193,6 +193,35 @@ try {
     }
   }
 
+  {
+    const profileEntry = { id: 'root:crawl', options: { id: 'crawl', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'crawl', transport: 'stdio' } } }
+    const calls = []
+    class FakeLoader extends Service {
+      constructor(c) { super(c, 'loader') }
+      entries() { return [profileEntry, { id: 'other', options: { name: 'dsh-other' } }] }
+    }
+    class FakePluginManager extends Service {
+      constructor(c) { super(c, 'pluginManager') }
+      async setPluginEnabled(id, enabled) {
+        calls.push([id, enabled])
+        profileEntry.options = { ...profileEntry.options, disabled: !enabled }
+        return { changed: true, application: 'applied', stage: 'enable', target: id, enabled }
+      }
+    }
+    const profileRow = () => gateway.snapshot().servers.find(r => r.key === 'profile#crawl')
+    await ctx.plugin(FakeLoader)
+    const unmanaged = await gateway.setProfileServerEnabled('root:crawl', false)
+    check('profile toggle without plugin manager: refused', unmanaged.ok === false && /plugin manager is unavailable/.test(unmanaged.error))
+    await ctx.plugin(FakePluginManager)
+    const off = await gateway.setProfileServerEnabled('root:crawl', false)
+    check('profile disable: plugin manager called with the loader entry id', off.ok && calls.at(-1)?.join() === 'root:crawl,false')
+    check('profile disable: row shows disabled after the rescan', profileRow()?.status === 'disabled' && profileRow()?.enabled === false)
+    const on = await gateway.setProfileServerEnabled('root:crawl', true)
+    check('profile enable: row back to configured', on.ok && profileRow()?.status === 'configured' && profileRow()?.enabled === true)
+    const foreign = await gateway.setProfileServerEnabled('other', false)
+    check('profile toggle refuses non mcp-client entries', foreign.ok === false && calls.length === 2)
+  }
+
   await a.scope.dispose()
   await b.scope.dispose()
   await stray.scope.dispose()

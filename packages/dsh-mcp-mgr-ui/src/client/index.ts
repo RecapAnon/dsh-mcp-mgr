@@ -38,6 +38,7 @@ interface McpMgrNamespace {
   apply(draft: McpServerDraft): Promise<RemoteResult<McpApplyResult>>
   removeServer(workspace: string, name: string): Promise<RemoteResult<McpApplyResult>>
   setServerEnabled(workspace: string, name: string, enabled: boolean): Promise<RemoteResult<McpApplyResult>>
+  setProfileServerEnabled(entryId: string, enabled: boolean): Promise<RemoteResult<McpApplyResult>>
   versionInfo(): Promise<RemoteResult<McpPluginVersionInfo>>
 }
 
@@ -95,6 +96,13 @@ export async function apply(ctx: ClientContext): Promise<void> {
       const result = await mcpMgr().setServerEnabled(workspace, name, enabled)
       if (!result.ok) {
         throw new Error(`mcpMgr.setServerEnabled failed: ${result.error.code}: ${result.error.message}`)
+      }
+      return result.value
+    },
+    setProfileServerEnabled: async (entryId, enabled) => {
+      const result = await mcpMgr().setProfileServerEnabled(entryId, enabled)
+      if (!result.ok) {
+        throw new Error(`mcpMgr.setProfileServerEnabled failed: ${result.error.code}: ${result.error.message}`)
       }
       return result.value
     },

@@ -82,6 +82,7 @@ npx @deepseek-ai/dsh plugin --profile web remove dsh-mcp-mgr
 - 工作区内每个 agent 都获得该工作区全部启用且非 conflict 的 server；不按 preset 过滤。
 - 兼容性：需要 `dsh-preset-tool-access` **>= 0.2.1**（更早版本的 `restrict` 遇到 agent 作用域工具名会抛错，并丢失其屏蔽）。
 - 设置页按工作区 server 显示：配置状态（`configured` / `disabled` / `conflict` / `error`）、运行 agent 数、已连接 agent 数（工具可见）与最近错误。
+- profile 级 server（来自 bundle 或 profile `cordis.patch.yml` 的 mcp-client 行）可在设置页禁用/启用：经宿主插件管理器在 profile `cordis.patch.yml` 写入 `disabled` 覆盖并立即对所有会话生效；插件管理器无法定位的行（位于 group 内、id 重复）会给出原因。
 - Windows 上建议直接用 `node` 启动 stdio server：停止时只结束直接子进程，`cmd /c npx …` 包装可能遗留孤儿进程。
 
 ### 插件配置
