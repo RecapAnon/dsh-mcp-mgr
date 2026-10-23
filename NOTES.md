@@ -9,6 +9,7 @@
 - 挂载失败：在锁内释放并等待旧句柄销毁，scope 空则销毁；下个 turn 重试；同一错误只告警一次
 - 空闲：`agent/status` idle 起计时，running 清除；计时到点且 agent 仍空闲（锁内再查）才停止
 - 配置变更：rescan 后对每个工作区 `configChanged`，仅停止已不在候选集中的 server；新增/修改留到下个 turn
+- stdio 经 `stdio-shim` 启动：mcp-client 的 SDK（`versionNegotiation: auto`）先起一个同参数的一次性进程发 `server/discover`，答复后杀掉再起真进程，慢 server 因此启动两次；shim 对首条 `server/discover` 自答 `-32601`（SDK 转 legacy）且不启动 server，其他首条消息才用 SDK 的 cross-spawn 启动真 server 并透传 stdio；cross-spawn 解析不到则不包装
 - 工作区解析：`realpath.native(cwd)` 与登记路径（已规范化）比较，不逐个 realpath；无 registry 时仅等于 `realpath.native(process.cwd())` 才命中；Web profile 的 registry 未就绪（loader 中有 `@deepseek-ai/dsh-workspace` 条目）视为无工作区
 
 ## 状态语义
@@ -21,5 +22,6 @@
 
 ## 排查教训
 
+- 首轮组装等满 `agentMountWaitMs` 且无工具：先量 server 启动耗时与 era 探测（是否启动两次），不是 Cordis fiber 激活被阻塞；e2e 以 pid 文件数断言每次挂载只启动一次
 - 改 `types.ts`（wire 字段）后必须重跑 `gen.mjs` 并**重打 UI bundle**：typert 客户端 codec 过期时，严格 codec 会静默剥离未知字段，且只影响通过 Remote 返回的数据，直接读 host 状态看不出来
 - 构建顺序（均从仓库根目录执行）：`pnpm run build:host → pnpm run build:client → pnpm run verify`；端到端：`node e2e/e2e.mjs`、`node e2e/apply-remove-settle.mjs`

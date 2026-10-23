@@ -13,9 +13,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 // The mcp-client plugin object; mounted once per agent and server.
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
+import type { Config as McpClientConfig } from '@deepseek-ai/dsh-mcp-client'
 import { createScope } from '@deepseek-ai/dsh-scope'
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import { agentWorkspace, collectWorkspaces, hasManagerFile, nativeRealpath } from './discovery.ts'
@@ -559,7 +562,7 @@ function openAgentScope(ctx: Context, agent: object): AgentScopeHandle {
   const scope = createScope(ctx, agent)
   return {
     mount: (config) => {
-      const fiber = scope.ctx.plugin(MCP_CLIENT_PLUGIN, config) as unknown as FiberView
+      const fiber = scope.ctx.plugin(MCP_CLIENT_PLUGIN, viaStdioShim(config)) as unknown as FiberView
       return {
         ready: fiber.await().then(() => undefined),
         dispose: async () => {
@@ -570,6 +573,25 @@ function openAgentScope(ctx: Context, agent: object): AgentScopeHandle {
     },
     dispose: () => scope.dispose(),
   }
+}
+
+/** The stdio shim and the cross-spawn of mcp-client's SDK, when both resolve. */
+const STDIO_SHIM = resolveStdioShim()
+
+function resolveStdioShim(): { script: string; spawnModule: string } | undefined {
+  try {
+    const sdk = createRequire(import.meta.resolve('@deepseek-ai/dsh-mcp-client')).resolve('@modelcontextprotocol/client/stdio')
+    const script = fileURLToPath(new URL('./stdio-shim.js', import.meta.url))
+    return existsSync(script) ? { script, spawnModule: createRequire(sdk).resolve('cross-spawn') } : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Launch a stdio server through the shim, so the era probe does not start it a second time. */
+function viaStdioShim(config: McpClientConfig): McpClientConfig {
+  if (config.transport !== 'stdio' || STDIO_SHIM === undefined) return config
+  return { ...config, command: process.execPath, args: [STDIO_SHIM.script, STDIO_SHIM.spawnModule, config.command, ...config.args] }
 }
 
 interface FiberView {

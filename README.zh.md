@@ -76,6 +76,7 @@ npx @deepseek-ai/dsh plugin --profile web remove dsh-mcp-mgr
 - 工作区工具使用 `mcp__<serverName>__<tool>` 命名。
 - 按 agent 懒挂载：agent（主 agent 或子 agent）在首个 turn 挂载其 session 所属工作区的 server（session `cwd` 的 realpath 须等于已登记工作区；headless 仅当其等于进程 cwd；Web 工作区登记服务尚未就绪时不挂载，下个 turn 重试）。仅打开会话不启动任何进程；不属于任何工作区的会话没有工作区工具。
 - 每个 agent 运行自己的 server 进程，仅该 agent 可见；`agentIdleTimeoutMs` 内无 turn 即停止，下个 turn 重新挂载；agent 销毁或插件卸载时停止。
+- 工作区 stdio server 经一个小的 `node` 启动器（`lib/types/stdio-shim.js`）启动，由它直接应答 mcp-client 的 `server/discover` 协议版本探测。否则该探测会在一个用完即弃的 server 副本上进行，慢启动的 server（如 `uv run --isolated`）每次挂载都要启动两次。因此工作区 stdio server 一律使用 2026 之前（legacy）的 MCP 握手。
 - 单次 agent 活动（running → idle）内所有挂载等待（含重新组装）共用一个 `agentMountWaitMs` 预算，turn 中止即停止等待；届时未就绪的 server 被跳过，在后台继续连接，连上后从后续 step 起可用。启动失败的 server 显示为最近错误，下个 turn 重试。
 - 组装期间挂载改变了 agent 的工具时，提示词组装重算一次；在本插件之后 prepend 的 `system-prompt/assemble` 监听器会因此多执行一次（该次输出被丢弃）。
 - mcp.json 变更：删除或禁用的 server 立即在所有 agent 上停止；新增或修改的 server 在各 agent 下个 turn 生效。

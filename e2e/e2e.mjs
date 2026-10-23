@@ -105,6 +105,7 @@ try {
   const firstA = await turn(a)
   check('AC7 first assembly of the first turn carries the tools', firstA.join() === 'mcp__onlyA__ping,mcp__spike__ping', firstA.join())
   check('re-assembly applies inner and outer listeners once each', lastMarks.join() === 'inner,outer', lastMarks.join())
+  check('stdio server started once per mount (no era-probe sibling)', readdirSync(pidDir).length === 2, `spawned=${readdirSync(pidDir).length}`)
   const firstB = await turn(b)
   check('AC5 workspace B agent sees only B tools', firstB.join() === 'mcp__spike__ping', firstB.join())
   check('AC5 same server name runs for both workspaces', alive() === 3, `alive=${alive()}`)
