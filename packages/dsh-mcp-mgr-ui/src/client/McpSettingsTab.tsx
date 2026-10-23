@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServerDraft, McpServerState, McpServerStatus } from 'dsh-mcp-mgr/types'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import { McpServerForm } from './McpServerForm.tsx'
+import { ToolPicker } from './ToolPicker.tsx'
 import type { McpLocaleKey } from './locales.ts'
 import css from './McpSettingsTab.module.css'
 
@@ -24,6 +25,10 @@ export interface McpSettingsTabInjected {
   setServerEnabled: (workspace: string, name: string, enabled: boolean) => Promise<McpApplyResult>
   /** Enable/disable one profile-level server through the host plugin manager. */
   setProfileServerEnabled: (entryId: string, enabled: boolean) => Promise<McpApplyResult>
+  /** Set the tools of one workspace server hidden from agents. */
+  setServerTools: (workspace: string, name: string, excludeTools: readonly string[]) => Promise<McpApplyResult>
+  /** Set the tools of one profile-level server hidden from agents. */
+  setProfileServerTools: (name: string, excludeTools: readonly string[]) => Promise<McpApplyResult>
   /** Self-update check result (startup npm lookup). */
   versionInfo: () => Promise<McpPluginVersionInfo>
   /** Registered workspaces for the add-form target picker. */
@@ -65,7 +70,8 @@ function shortPath(path: string, forceLastTwo = false): string {
 
 /** Render the currently registered MCP servers (workspace + profile sources). */
 export function McpSettingsTab({
-  snapshot, apply, removeServer, setServerEnabled, setProfileServerEnabled, versionInfo, listWorkspaces, currentWorkspacePath, t,
+  snapshot, apply, removeServer, setServerEnabled, setProfileServerEnabled, setServerTools, setProfileServerTools,
+  versionInfo, listWorkspaces, currentWorkspacePath, t,
 }: McpSettingsTabProps): ReactNode {
   const [request, setRequest] = useState(0)
   const [state, setState] = useState<ViewState>({ status: 'loading' })
@@ -74,6 +80,7 @@ export function McpSettingsTab({
   const [notice, setNotice] = useState<string | null>(null)
   const [updateInfo, setUpdateInfo] = useState<McpPluginVersionInfo | null>(null)
   const [showForm, setShowForm] = useState(false)
+  const [toolsOpen, setToolsOpen] = useState<string | null>(null)
 
   useEffect(() => {
     let current = true
@@ -172,6 +179,28 @@ export function McpSettingsTab({
     setNotice(result.ok ? (enabled ? t('enabled') : t('disabled')) : `${t('applyFailed')}: ${result.error}`)
   }
 
+  const onSaveTools = async (server: McpServerState, excluded: readonly string[]): Promise<void> => {
+    const { workspace } = server
+    if (server.source === 'workspace' && workspace === undefined) return
+    setBusy(server.key)
+    setNotice(null)
+    let result: McpApplyResult
+    try {
+      result = server.source === 'workspace' && workspace !== undefined
+        ? await setServerTools(workspace, server.name, excluded)
+        : await setProfileServerTools(server.name, excluded)
+    } catch (error) {
+      setBusy(null)
+      setNotice(`${t('applyFailed')}: ${String(error instanceof Error ? error.message : error)}`)
+      return
+    }
+    setBusy(null)
+    if (result.ok) setToolsOpen(null)
+    setState({ status: 'loading' })
+    setRequest(value => value + 1)
+    setNotice(result.ok ? t('toolsSaved') : `${t('applyFailed')}: ${result.error}`)
+  }
+
   return (
     <div className={css.section} aria-busy={state.status === 'loading'}>
       {/* Transient result feedback: floats over the viewport, never pushes the table. */}
@@ -237,8 +266,24 @@ export function McpSettingsTab({
           <tbody>
             {servers.map((server) => {
               const fullPath = server.source === 'workspace' ? server.workspace : server.sourceFile
+              const toolCount = server.tools === undefined
+                ? ''
+                : ` ${server.tools.length - (server.excludedTools?.length ?? 0)}/${server.tools.length}`
+              const toolsButton = server.status === 'error' && server.transport === undefined ? null : (
+                <button
+                  type="button"
+                  className={css.toggle}
+                  aria-expanded={toolsOpen === server.key}
+                  disabled={busy === server.key}
+                  title={t('toolsHint')}
+                  onClick={() => { setToolsOpen(open => open === server.key ? null : server.key) }}
+                >
+                  {`${t('tools')}${toolCount}`}
+                </button>
+              )
               return (
-                <tr key={server.key} data-source={server.source}>
+                <Fragment key={server.key}>
+                <tr data-source={server.source}>
                   <td className={css.sourceCell}>
                     {fullPath !== undefined
                       ? <span className={css.sourcePath} title={fullPath}>{sourceDisplay.get(server.key)}</span>
@@ -264,6 +309,7 @@ export function McpSettingsTab({
                     ) : null}
                   </td>
                   <td className={css.nowrapCell}>
+                    {toolsButton}
                     {server.source === 'workspace' ? (
                       <>
                         <button
@@ -296,6 +342,20 @@ export function McpSettingsTab({
                     ) : null}
                   </td>
                 </tr>
+                {toolsOpen === server.key ? (
+                  <tr data-source={server.source}>
+                    <td colSpan={6}>
+                      <ToolPicker
+                        server={server}
+                        busy={busy === server.key}
+                        t={t}
+                        save={(excluded) => { void onSaveTools(server, excluded) }}
+                        close={() => { setToolsOpen(null) }}
+                      />
+                    </td>
+                  </tr>
+                ) : null}
+                </Fragment>
               )
             })}
           </tbody>

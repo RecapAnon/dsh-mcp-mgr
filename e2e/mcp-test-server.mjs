@@ -1,6 +1,7 @@
 /**
  * Minimal stdio MCP server used by the e2e verification. With MCP_PID_DIR set
- * it records its pid there so the test can observe process exit.
+ * it records its pid there so the test can observe process exit; with
+ * MCP_EXTRA_TOOLS set it also lists an `echo` tool.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -15,4 +16,7 @@ server.tool(
   { msg: z.string() },
   async ({ msg }) => ({ content: [{ type: 'text', text: `pong:${msg}` }] }),
 )
+if (process.env.MCP_EXTRA_TOOLS) {
+  server.tool('echo', { msg: z.string() }, async ({ msg }) => ({ content: [{ type: 'text', text: msg }] }))
+}
 await server.connect(new StdioServerTransport())

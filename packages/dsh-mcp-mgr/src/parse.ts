@@ -16,6 +16,8 @@ export interface ParsedServer {
   /** Whether the entry is enabled (`enabled: false` disables; absent/other = enabled). */
   readonly enabled: boolean
   readonly config: McpClientConfig
+  /** Tool names (public name without `mcp__<name>__`) never registered for this server. */
+  readonly excludeTools: readonly string[]
 }
 
 /** One rejected server entry with the reason. */
@@ -107,6 +109,11 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       continue
     }
     const transport = rawType === 'stdio' ? 'stdio' : 'streamable-http'
+    const excludeTools = parseToolList(rawEntry.excludeTools)
+    if (excludeTools === undefined) {
+      errors.push({ name, message: '"excludeTools" must be an array of strings' })
+      continue
+    }
     if (transport === 'stdio') {
       const command = asString(rawEntry.command)
       if (command === undefined || command.length === 0) {
@@ -142,6 +149,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       servers.push({
         name,
         enabled,
+        excludeTools,
         config: {
           transport: 'stdio',
           serverName: name,
@@ -170,6 +178,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       servers.push({
         name,
         enabled,
+        excludeTools,
         config: {
           transport: 'streamable-http',
           serverName: name,
@@ -182,6 +191,13 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
     }
   }
   return { servers, errors }
+}
+
+/** Sorted, de-duplicated tool list; undefined when the value is not a string array. */
+export function parseToolList(value: unknown): string[] | undefined {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.length === 0)) return undefined
+  return [...new Set(value as string[])].sort()
 }
 
 /** Serialize a server draft back into one mcpServers entry. */

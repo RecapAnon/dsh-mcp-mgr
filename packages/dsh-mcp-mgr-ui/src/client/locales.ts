@@ -57,6 +57,15 @@ export const zh = {
   updateAvailable: '插件有新版本可用，点击',
   updateAvailableLink: '查看升级方式',
   profileToggleHint: '通过宿主插件管理器写入 profile 的 cordis.patch.yml 并立即生效（所有会话）',
+  tools: '工具',
+  toolsHint: '选择该服务向 agent 暴露的工具；取消勾选的工具不会进入提示词',
+  toolsHintWorkspace: '保存到 mcp.json 的 excludeTools，各 agent 在下个 turn 以新设置重新挂载该服务。',
+  toolsHintProfile: '保存到 profile 的 dshmm/tools.json，各 agent 在下个 turn 生效。',
+  toolsUnknown: '工具列表在 agent 首次使用该服务后出现。',
+  toolsAll: '全选',
+  toolsNone: '全不选',
+  toolsSaved: '工具设置已保存，下个 turn 生效',
+  save: '保存',
 } satisfies Record<string, string>
 
 /** MCP manager locale key union. */
@@ -119,4 +128,13 @@ export const en: Record<McpLocaleKey, string> = {
   updateAvailable: 'A new plugin version is available. Click',
   updateAvailableLink: 'to see how to upgrade.',
   profileToggleHint: 'Saved to the profile cordis.patch.yml through the host plugin manager and applied immediately (all sessions)',
+  tools: 'Tools',
+  toolsHint: 'Choose which of this server\'s tools agents see; unchecked tools never reach the prompt',
+  toolsHintWorkspace: 'Saved as excludeTools in mcp.json; each agent remounts the server with it at its next turn.',
+  toolsHintProfile: 'Saved to the profile\'s dshmm/tools.json; applies at each agent\'s next turn.',
+  toolsUnknown: 'Tools are listed once an agent has used this server.',
+  toolsAll: 'Select all',
+  toolsNone: 'Select none',
+  toolsSaved: 'Tool selection saved; applies at the next turn',
+  save: 'Save',
 }

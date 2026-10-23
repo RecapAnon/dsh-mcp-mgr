@@ -18,9 +18,17 @@ export interface MountHandle {
   dispose(): Promise<void>
 }
 
+/** Registration-time tool filter of one mount. */
+export interface ToolFilter {
+  /** Tool names (public name without `mcp__<serverName>__`) never registered. */
+  readonly exclude: ReadonlySet<string>
+  /** Called for every tool the server lists, excluded or not. */
+  seen(tool: string): void
+}
+
 /** An agent-keyed registration scope. */
 export interface AgentScopeHandle {
-  mount(config: McpClientConfig): MountHandle
+  mount(config: McpClientConfig, filter: ToolFilter): MountHandle
   dispose(): Promise<void>
 }
 
@@ -34,6 +42,8 @@ export interface MountsHost {
   /** Run `release` when the agent is disposed; undefined when the agent is already inactive. */
   onAgentDispose(agent: object, release: () => Promise<void>): (() => void) | undefined
   isIdle(agent: object): boolean
+  /** A server of the workspace listed `tool` (excluded or not). */
+  toolSeen(workspace: string, server: string, tool: string): void
   warn(message: string): void
 }
 
@@ -43,7 +53,8 @@ export interface MountsOptions {
 }
 
 interface Live {
-  readonly config: McpClientConfig
+  /** Config plus tool filter; a different fingerprint remounts. */
+  readonly fingerprint: string
   readonly handle: MountHandle
   settled: boolean
   failed: boolean
@@ -199,7 +210,7 @@ export class AgentMounts {
       const wanted = this.host.candidates(workspace)
       const byName = new Map(wanted.map(server => [server.name, server]))
       await this.stop(state, [...state.servers]
-        .filter(([name, live]) => live.failed || !sameConfig(live.config, byName.get(name)?.config))
+        .filter(([name, live]) => live.failed || live.fingerprint !== fingerprintOf(byName.get(name)))
         .map(([name]) => name))
       if (!this.alive(state)) return SETTLED
       const done = Promise.all(wanted.map(server => this.ensure(state, workspace, server))).then(() => undefined)
@@ -215,12 +226,15 @@ export class AgentMounts {
     let handle: MountHandle
     try {
       state.scope ??= this.host.openScope(state.agent)
-      handle = state.scope.mount(server.config)
+      handle = state.scope.mount(server.config, {
+        exclude: new Set(server.excludeTools),
+        seen: tool => { this.host.toolSeen(workspace, server.name, tool) },
+      })
     } catch (error) {
       this.mountFailed(key, error)
       return Promise.resolve()
     }
-    const live: Live = { config: server.config, handle, settled: false, failed: false }
+    const live: Live = { fingerprint: fingerprintOf(server), handle, settled: false, failed: false }
     state.servers.set(server.name, live)
     live.ready = handle.ready.then(() => {
       live.settled = true
@@ -302,8 +316,10 @@ export class AgentMounts {
   }
 }
 
-function sameConfig(left: McpClientConfig, right: McpClientConfig | undefined): boolean {
-  return right !== undefined && JSON.stringify(left) === JSON.stringify(right)
+function fingerprintOf(server: ParsedServer): string
+function fingerprintOf(server: ParsedServer | undefined): string | undefined
+function fingerprintOf(server: ParsedServer | undefined): string | undefined {
+  return server === undefined ? undefined : JSON.stringify([server.config, server.excludeTools])
 }
 
 function message(error: unknown): string {

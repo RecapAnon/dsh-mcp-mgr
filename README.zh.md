@@ -70,6 +70,7 @@ npx @deepseek-ai/dsh plugin --profile web remove dsh-mcp-mgr
 - stdio server 未指定 `cwd` 时使用工作区根目录。
 - `serverName` 只需在单个 mcp.json 内唯一，不同工作区可同名；与 profile 级 mcp-client server 同名时显示 `conflict` 且不挂载。
 - 设置 `"enabled": false` 可禁用条目但不删除；缺省为启用。
+- 设置 `"excludeTools": ["<工具名>", ...]` 可对所有 agent 隐藏该 server 的部分工具（不注册，因此不进入提示词）。工具名为 `mcp__<serverName>__` 之后的部分，除非原名含 `[A-Za-z0-9_-]` 以外的字符，否则即 server 自己的工具名。
 
 ## 行为与限制
 
@@ -84,6 +85,7 @@ npx @deepseek-ai/dsh plugin --profile web remove dsh-mcp-mgr
 - 兼容性：需要 `dsh-preset-tool-access` **>= 0.2.1**（更早版本的 `restrict` 遇到 agent 作用域工具名会抛错，并丢失其屏蔽）。
 - 设置页按工作区 server 显示：配置状态（`configured` / `disabled` / `conflict` / `error`）、运行 agent 数、已连接 agent 数（工具可见）与最近错误。
 - profile 级 server（来自 bundle 或 profile `cordis.patch.yml` 的 mcp-client 行）可在设置页禁用/启用：经宿主插件管理器在 profile `cordis.patch.yml` 写入 `disabled` 覆盖并立即对所有会话生效；插件管理器无法定位的行（位于 group 内、id 重复）会给出原因。
+- 按工具选择：每行的 **工具** 按钮列出该 server 的工具，逐个勾选。工作区 server 保存为 mcp.json 的 `excludeTools`，各 agent 在下个 turn 以新设置重新挂载；工具列表在 agent 首次使用该 server 后出现。profile 级 server 保存到 `<profileDir>/dshmm/tools.json`（`{ "excludeTools": { "<serverName>": ["<工具名>"] } }`，可手改），各 agent 在下个 turn 经 `tools.restrict` 隐藏；卸载本插件即解除。
 - Windows 上建议直接用 `node` 启动 stdio server：停止时只结束直接子进程，`cmd /c npx …` 包装可能遗留孤儿进程。
 
 ### 插件配置

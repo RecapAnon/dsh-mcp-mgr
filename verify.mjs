@@ -32,6 +32,8 @@ console.log('parse:')
       'bad.name': { command: 'x' },
       missingCmd: { type: 'stdio' },
       brokenEnv: { type: 'stdio', command: 'x', env: { K: '${MCP_TEST_MISSING_VAR}' } },
+      trimmed: { type: 'http', url: 'http://x/mcp', excludeTools: ['pdf', 'html', 'pdf'] },
+      badTools: { type: 'http', url: 'http://x/mcp', excludeTools: 'pdf' },
     },
   })
   process.env.MCP_TEST_TOKEN = 'tok-123'
@@ -48,6 +50,9 @@ console.log('parse:')
   check('enabled defaults true when absent', parsed.servers.find(s => s.name === 'memory')?.enabled === true)
   check('explicit enabled:false parsed', parsed.servers.find(s => s.name === 'off')?.enabled === false)
   check('expandEnv literal passthrough', expandEnv('hello', 'x').ok && expandEnv('hello', 'x').value === 'hello')
+  check('excludeTools parsed sorted and de-duplicated', parsed.servers.find(s => s.name === 'trimmed')?.excludeTools.join() === 'html,pdf')
+  check('excludeTools defaults to empty', parsed.servers.find(s => s.name === 'memory')?.excludeTools.length === 0)
+  check('non-array excludeTools rejected', parsed.errors.some(e => e.name === 'badTools'))
   check('agent mounts fail on startup error', parsed.servers.every(s => s.config.failOnStartupError === true))
   delete process.env.MCP_TEST_TOKEN
 }
@@ -56,7 +61,7 @@ console.log('parse:')
 console.log('agent mounts:')
 {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-  const srv = (name, extra = {}) => ({ name, enabled: extra.enabled ?? true, config: { transport: 'stdio', serverName: name, command: extra.command ?? 'x', args: [], env: {}, cwd: '/ws', toolCallTimeoutMs: 60000, failOnStartupError: true } })
+  const srv = (name, extra = {}) => ({ name, enabled: extra.enabled ?? true, excludeTools: extra.excludeTools ?? [], config: { transport: 'stdio', serverName: name, command: extra.command ?? 'x', args: [], env: {}, cwd: '/ws', toolCallTimeoutMs: 60000, failOnStartupError: true } })
   function harness(options = {}) {
     const h = {
       config: options.config ?? {},
@@ -72,6 +77,8 @@ console.log('agent mounts:')
       scopes: 0,
       warnings: [],
       visible: new Map(),
+      filters: new Map(),
+      seen: [],
     }
     h.see = agent => [...(h.visible.get(agent) ?? [])].sort()
     h.open = (name) => {
@@ -85,8 +92,10 @@ console.log('agent mounts:')
       openScope: (agent) => {
         h.scopes += 1
         return {
-          mount: (config) => {
+          mount: (config, filter) => {
             const name = config.serverName
+            h.filters.set(`${agent.id}:${name}`, [...filter.exclude].sort().join())
+            filter.seen('t1')
             const id = `${agent.id}:${name}`
             h.started.push(id)
             if (h.live.has(id)) h.clashes += 1
@@ -125,6 +134,7 @@ console.log('agent mounts:')
       },
       onAgentDispose: (agent, release) => (agent.inactive ? undefined : (agent.dispose = release, () => { agent.unhooked = true })),
       isIdle: agent => agent.status !== 'running',
+      toolSeen: (ws, server, tool) => { h.seen.push(`${ws}#${server}:${tool}`) },
       warn: message => { h.warnings.push(message) },
     }
     h.mounts = new AgentMounts(h.host, { idleTimeoutMs: options.idleTimeoutMs ?? 60_000, mountWaitMs: options.mountWaitMs ?? 300 })
@@ -301,6 +311,22 @@ console.log('agent mounts:')
     await h.mounts.dispose()
   }
 
+  // excludeTools: passed to the mount; a changed list remounts at the next turn
+  {
+    const h = harness({ config: { '/A': [srv('t', { excludeTools: ['x'] })] } })
+    const a = agent('a', '/A')
+    await h.mounts.turn(a)
+    check('mount receives the exclusion filter and reports seen tools', h.filters.get('a:t') === 'x' && h.seen.includes('/A#t:t1'))
+    h.config['/A'] = [srv('t', { excludeTools: ['x', 'y'] })]
+    newActivity(h, a)
+    await h.mounts.turn(a)
+    check('changed excludeTools remounts at the next turn', h.started.filter(s => s === 'a:t').length === 2 && h.filters.get('a:t') === 'x,y' && h.clashes === 0)
+    newActivity(h, a)
+    await h.mounts.turn(a)
+    check('unchanged excludeTools does not remount', h.started.filter(s => s === 'a:t').length === 2)
+    await h.mounts.dispose()
+  }
+
   // AC12 / AC13: unmatched cwd mounts nothing; re-checked at the next turn
   {
     const h = harness({ config: { '/A': [srv('s')] } })
@@ -447,13 +473,14 @@ console.log('workspace resolution:')
     let opened = 0
     const lateMounts = new AgentMounts({
       workspaceOf: a => agentWorkspace(late, a.cwd),
-      candidates: () => [{ name: 's', enabled: true, config: { transport: 'stdio', serverName: 's', command: 'x', args: [], env: {}, cwd: ws, toolCallTimeoutMs: 60000, failOnStartupError: true } }],
+      candidates: () => [{ name: 's', enabled: true, excludeTools: [], config: { transport: 'stdio', serverName: 's', command: 'x', args: [], env: {}, cwd: ws, toolCallTimeoutMs: 60000, failOnStartupError: true } }],
       openScope: () => {
         opened += 1
         return { mount: () => ({ ready: Promise.resolve(), dispose: async () => {} }), dispose: async () => {} }
       },
       onAgentDispose: () => () => {},
       isIdle: () => false,
+      toolSeen: () => {},
       warn: message => lateWarnings.push(message),
     }, { idleTimeoutMs: 60_000, mountWaitMs: 5_000 })
     const running = { cwd: ws, status: 'running' }
@@ -481,6 +508,50 @@ console.log('draft validation:')
   check('missing url rejected', validateDraft({ name: 'a', transport: 'streamable-http' }) !== undefined)
   check('non-string env rejected', validateDraft({ name: 'a', transport: 'stdio', command: 'x', env: { K: 1 } }) !== undefined)
   check('non-string header rejected', validateDraft({ name: 'a', transport: 'streamable-http', url: 'http://x', headers: { A: 1 } }) !== undefined)
+}
+
+// ── 2c. profile tool restrictions ──────────────────────────────────────────
+console.log('profile tool restrictions:')
+{
+  const { ProfileRestrictions, parseProfileTools } = await import(pathToFileURL(join(root, './packages/dsh-mcp-mgr/lib/types/restrict.js')).href)
+  const parsed = parseProfileTools(JSON.stringify({ excludeTools: { crawl: ['pdf', 'html'], bad: 'x', empty: [] } }))
+  check('tools.json parsed; invalid entry reported, empty list dropped', parsed.exclusions.get('crawl')?.join() === 'html,pdf' && !parsed.exclusions.has('empty') && parsed.errors.length === 1)
+  check('tools.json invalid JSON reported', parseProfileTools('{').errors.length === 1)
+  let exclusions = new Map([['crawl', ['pdf']]])
+  const installed = []
+  let fail = false
+  const warnings = []
+  const host = {
+    exclusions: () => exclusions,
+    globalToolNames: () => ['mcp__crawl__md', 'mcp__crawl__pdf', 'mcp__other__pdf', 'web_fetch'],
+    restrict: (agent, deny) => {
+      if (fail) throw new Error('unknown global tool')
+      const record = { agent, deny: deny.join(), live: true }
+      installed.push(record)
+      return () => { record.live = false }
+    },
+    onAgentDispose: (agent, release) => (agent.inactive ? undefined : (agent.dispose = release, () => { agent.unhooked = true })),
+    warn: message => warnings.push(message),
+  }
+  const r = new ProfileRestrictions(host)
+  const a = {}
+  check('restriction installed with only the excluded server tool', r.apply(a) === true && installed.length === 1 && installed[0].deny === 'mcp__crawl__pdf')
+  check('unchanged exclusions: no new restriction', r.apply(a) === false && installed.length === 1)
+  exclusions = new Map([['crawl', ['md', 'pdf']]])
+  check('changed exclusions: new restriction replaces the old one', r.apply(a) === true && installed.length === 2 && installed[1].deny === 'mcp__crawl__md,mcp__crawl__pdf' && !installed[0].live && installed[1].live)
+  exclusions = new Map()
+  check('cleared exclusions: restriction lifted', r.apply(a) === true && !installed[1].live)
+  check('no exclusions and no state: nothing installed', r.apply({}) === false && installed.length === 2)
+  exclusions = new Map([['crawl', ['pdf']]])
+  fail = true
+  check('refused restriction warns once, keeps going', r.apply(a) === false && r.apply(a) === false && warnings.length === 1)
+  fail = false
+  check('inactive agent gets no restriction', r.apply({ inactive: true }) === false && installed.length === 2)
+  const b = {}
+  r.apply(b)
+  r.dispose()
+  check('dispose lifts every restriction and unhooks', installed.every(record => !record.live) && b.unhooked === true)
+  check('after dispose nothing is installed', r.apply({}) === false)
 }
 
 // ── 3. profile entry scan ───────────────────────────────────────────────────
@@ -538,7 +609,13 @@ console.log('remote artifact:')
 {
   const contribution = (await import(pathToFileURL(join(root, './packages/dsh-mcp-mgr/lib/typert.remote-client.js')).href)).default
   check('package identity', contribution.package === 'dsh-mcp-mgr')
-  check('six methods', contribution.descriptors.length === 6)
+  check('eight methods', contribution.descriptors.length === 8)
+  const wsTools = contribution.descriptors.find(d => d.method === 'setServerTools')
+  check('setServerTools has three parameters', wsTools?.parameters.map(p => p.wire).join(',') === 'workspace,serverName,excludeTools')
+  const profTools = contribution.descriptors.find(d => d.method === 'setProfileServerTools')
+  check('setProfileServerTools has two parameters', profTools?.parameters.map(p => p.wire).join(',') === 'serverName,excludeTools')
+  const toolSnap = contribution.descriptors.find(d => d.method === 'snapshot').result.create().parse({ servers: [{ key: 'k', source: 'workspace', workspace: '/w', name: 'n', transport: 'stdio', status: 'configured', tools: ['a', 'b'], excludedTools: ['b'] }], watchedWorkspaces: ['/w'] })
+  check('snapshot codec keeps tools / excludedTools', toolSnap.servers[0].tools.join() === 'a,b' && toolSnap.servers[0].excludedTools.join() === 'b')
   const profileToggle = contribution.descriptors.find(d => d.method === 'setProfileServerEnabled')
   check('setProfileServerEnabled has two parameters', profileToggle?.parameters.map(p => p.wire).join(',') === 'entryId,enabled')
   const profileSnap = profileToggle && contribution.descriptors.find(d => d.method === 'snapshot').result.create().parse({ servers: [{ key: 'profile#a', source: 'profile', name: 'a', transport: 'stdio', enabled: false, status: 'disabled', entryId: 'a' }], watchedWorkspaces: [] })

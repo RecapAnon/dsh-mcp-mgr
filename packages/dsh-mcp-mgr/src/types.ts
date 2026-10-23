@@ -45,6 +45,13 @@ export interface McpServerState {
   readonly workspace?: string
   /** Profile source only: config file declaring the entry. */
   readonly sourceFile?: string
+  /**
+   * Tool names (public name without `mcp__<name>__`) known for this server,
+   * excluded ones included. Workspace rows know them once an agent mounted the server.
+   */
+  readonly tools?: readonly string[]
+  /** Tool names hidden from every agent. */
+  readonly excludedTools?: readonly string[]
 }
 
 /** Self-update check result served to the UI; '' means the value is unknown. */

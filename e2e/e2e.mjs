@@ -8,10 +8,11 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { createScope } from '@deepseek-ai/dsh-scope'
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import { McpMgrGateway } from '../packages/dsh-mcp-mgr/lib/types/index.js'
 import { waitFor } from './wait-for.mjs'
 
@@ -26,8 +27,10 @@ const pidDir = join(base, 'pids')
 const wsA = join(base, 'A')
 const wsB = join(base, 'B')
 const wsC = join(base, 'C')
+const wsD = join(base, 'D')
 const outside = join(base, 'outside')
-for (const dir of [pidDir, wsA, wsB, wsC, outside]) mkdirSync(dir, { recursive: true })
+const profileDir = join(base, 'profile')
+for (const dir of [pidDir, wsA, wsB, wsC, wsD, outside, profileDir]) mkdirSync(dir, { recursive: true })
 const serverScript = fileURLToPath(new URL('./mcp-test-server.mjs', import.meta.url))
 const entry = () => ({ type: 'stdio', command: process.execPath, args: [serverScript], env: { MCP_PID_DIR: pidDir } })
 const writeConfig = (ws, names, make = entry) => {
@@ -37,6 +40,7 @@ const writeConfig = (ws, names, make = entry) => {
 writeConfig(wsA, ['spike', 'onlyA'])
 writeConfig(wsB, ['spike'])
 writeConfig(wsC, ['broken'], () => ({ type: 'stdio', command: join(base, 'no-such-executable') }))
+writeConfig(wsD, ['multi'], () => ({ ...entry(), env: { MCP_PID_DIR: pidDir, MCP_EXTRA_TOOLS: '1' }, excludeTools: ['echo'] }))
 
 const alive = () => readdirSync(pidDir).filter((pid) => {
   try { process.kill(Number(pid), 0); return true } catch { return false }
@@ -55,13 +59,18 @@ class StubSystemPrompt extends Service {
 
 class FakeWorkspaceRegistry extends Service {
   constructor(ctx) { super(ctx, 'workspaceRegistry') }
-  list() { return [{ path: wsA }, { path: wsB }, { path: wsC }] }
+  list() { return [{ path: wsA }, { path: wsB }, { path: wsC }, { path: wsD }] }
+}
+
+class FakeProfileContext extends Service {
+  constructor(ctx) { super(ctx, 'profileContext'); this.name = 'e2e'; this.dir = profileDir }
 }
 
 const ctx = new Context()
 await ctx.plugin(StubSystemPrompt)
 await ctx.plugin(ToolRuntime)
 await ctx.plugin(FakeWorkspaceRegistry)
+await ctx.plugin(FakeProfileContext)
 let gateway
 const plugin = ctx.plugin({
   name: 'mcp-mgr',
@@ -194,6 +203,59 @@ try {
     }
   }
 
+  // workspace excludeTools: filtered at registration, change remounts at the next turn
+  {
+    const d = makeAgent(wsD)
+    const key = `${wsD}#multi`
+    check('excludeTools: excluded workspace tool never registered', (await turn(d)).join() === 'mcp__multi__ping' && view(d).join() === 'mcp__multi__ping')
+    check('excludeTools: row lists every tool and the exclusion', row(key)?.tools?.join() === 'echo,ping' && row(key)?.excludedTools?.join() === 'echo', JSON.stringify(row(key)))
+    const cleared = await gateway.setServerTools(wsD, 'multi', [])
+    check('setServerTools: empty list removes the field', cleared.ok && row(key)?.excludedTools === undefined)
+    d.status = 'idle'
+    ctx.emit('agent/status', { agent: d, status: 'idle' })
+    d.status = 'running'
+    ctx.emit('agent/status', { agent: d, status: 'running' })
+    check('setServerTools: next turn remounts with every tool', (await turn(d)).join() === 'mcp__multi__echo,mcp__multi__ping')
+    const swapped = await gateway.setServerTools(wsD, 'multi', ['ping'])
+    d.status = 'idle'
+    ctx.emit('agent/status', { agent: d, status: 'idle' })
+    d.status = 'running'
+    ctx.emit('agent/status', { agent: d, status: 'running' })
+    check('setServerTools: new exclusion applied at the next turn', swapped.ok && (await turn(d)).join() === 'mcp__multi__echo')
+    const bad = await gateway.setServerTools(wsD, 'multi', [''])
+    check('setServerTools: rejects empty tool names', bad.ok === false)
+    await d.scope.dispose()
+  }
+
+  // profile tools.json: global tools hidden per agent through tools.restrict
+  {
+    const prof = ctx.plugin({ name: mcpClient.name, inject: mcpClient.inject, apply: mcpClient.apply }, {
+      transport: 'stdio', serverName: 'prof', command: process.execPath, args: [serverScript],
+      env: { MCP_PID_DIR: pidDir, MCP_EXTRA_TOOLS: '1' }, cwd: base, toolCallTimeoutMs: 60000, failOnStartupError: true,
+    })
+    await prof.await()
+    const p = makeAgent(outside)
+    check('profile tools: all global tools visible before any exclusion', (await turn(p)).join() === 'mcp__prof__echo,mcp__prof__ping')
+    const saved = await gateway.setProfileServerTools('prof', ['echo'])
+    const stored = JSON.parse(readFileSync(join(profileDir, 'dshmm', 'tools.json'), 'utf8'))
+    check('setProfileServerTools: written to <profileDir>/dshmm/tools.json', saved.ok && stored.excludeTools.prof.join() === 'echo', JSON.stringify(stored))
+    check('profile tools: excluded tool hidden from the same turn assembly', (await turn(p)).join() === 'mcp__prof__ping' && view(p).join() === 'mcp__prof__ping')
+    check('profile tools: global view keeps the tool', tools.schemas().some(schema => schema.name === 'mcp__prof__echo'))
+    const other = makeAgent(wsB)
+    check('profile tools: every agent gets the restriction', (await turn(other)).join() === 'mcp__prof__ping,mcp__spike__ping')
+    await gateway.setProfileServerTools('prof', [])
+    check('profile tools: clearing the list restores the tool at the next turn', (await turn(p)).join() === 'mcp__prof__echo,mcp__prof__ping')
+    check('setProfileServerTools: empty list removes the server key', JSON.stringify(JSON.parse(readFileSync(join(profileDir, 'dshmm', 'tools.json'), 'utf8'))) === '{}')
+    writeFileSync(join(profileDir, 'dshmm', 'tools.json'), JSON.stringify({ excludeTools: { prof: ['ping'] } }))
+    await gateway.rescan()
+    check('profile tools: hand edit picked up by the rescan', (await turn(p)).join() === 'mcp__prof__echo')
+    await gateway.setProfileServerTools('prof', [])
+    await turn(p)
+    await other.scope.dispose()
+    await p.scope.dispose()
+    await prof.dispose()
+  }
+
   {
     const profileEntry = { id: 'root:crawl', options: { id: 'crawl', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'crawl', transport: 'stdio' } } }
     const calls = []
@@ -229,10 +291,18 @@ try {
   await waitFor(() => alive() === 0, 10_000).catch(() => undefined)
   check('agent disposal stops every remaining process', alive() === 0, `alive=${alive()}`)
 
+  const prof = ctx.plugin({ name: mcpClient.name, inject: mcpClient.inject, apply: mcpClient.apply }, {
+    transport: 'stdio', serverName: 'prof', command: process.execPath, args: [serverScript],
+    env: { MCP_EXTRA_TOOLS: '1' }, cwd: base, toolCallTimeoutMs: 60000, failOnStartupError: true,
+  })
+  await prof.await()
+  await gateway.setProfileServerTools('prof', ['echo'])
   const c = makeAgent(wsB)
   await turn(c)
-  check('plugin unload: mounted before unload', alive() === 1)
+  check('plugin unload: mounted and restricted before unload', alive() === 1 && !tools.schemas(c).some(schema => schema.name === 'mcp__prof__echo'))
   await plugin.dispose()
+  check('plugin unload lifts profile tool restrictions', tools.schemas(c).some(schema => schema.name === 'mcp__prof__echo'))
+  await prof.dispose()
   await waitFor(() => alive() === 0, 10_000).catch(() => undefined)
   check('plugin unload (plugin scope only) stops agent processes', alive() === 0, `alive=${alive()}`)
   check('plugin unload leaves agents and root services intact', view(c).length === 0 && ctx.get('tools') !== undefined)

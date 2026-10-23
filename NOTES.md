@@ -9,6 +9,9 @@
 - 挂载失败：在锁内释放并等待旧句柄销毁，scope 空则销毁；下个 turn 重试；同一错误只告警一次
 - 空闲：`agent/status` idle 起计时，running 清除；计时到点且 agent 仍空闲（锁内再查）才停止
 - 配置变更：rescan 后对每个工作区 `configChanged`，仅停止已不在候选集中的 server；新增/修改留到下个 turn
+- 工具过滤（工作区）：挂载时把 mcp-client 的 ctx 包一层 Proxy，只替换 `tools.register`（被排除的返回空 disposer，并记录所见工具名到 catalog），其余按原 receiver 透传；`excludeTools` 计入挂载指纹，变更即在下个 turn 重挂载
+- 工具过滤（profile）：`<profileDir>/dshmm/tools.json`（目录取 `profileContext.dir`）；每次组装时对 agent `tools.restrict({ deny })`，deny 只取全局层中匹配的名字（restrict 拒绝未知名）；集合变化才换新 restriction（先装新再撤旧），算作“有变化”触发重组装；插件卸载时撤销全部
+- 工具名 = 公共名去掉 `mcp__<server>__` 前缀（server 名 ≤32，前缀不会被截断/哈希），不复刻 mcp-client 的哈希逻辑
 - stdio 经 `stdio-shim` 启动：mcp-client 的 SDK（`versionNegotiation: auto`）先起一个同参数的一次性进程发 `server/discover`，答复后杀掉再起真进程，慢 server 因此启动两次；shim 对首条 `server/discover` 自答 `-32601`（SDK 转 legacy）且不启动 server，其他首条消息才用 SDK 的 cross-spawn 启动真 server 并透传 stdio；cross-spawn 解析不到则不包装
 - 工作区解析：`realpath.native(cwd)` 与登记路径（已规范化）比较，不逐个 realpath；无 registry 时仅等于 `realpath.native(process.cwd())` 才命中；Web profile 的 registry 未就绪（loader 中有 `@deepseek-ai/dsh-workspace` 条目）视为无工作区
 

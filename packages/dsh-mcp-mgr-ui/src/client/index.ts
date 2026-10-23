@@ -39,6 +39,8 @@ interface McpMgrNamespace {
   removeServer(workspace: string, name: string): Promise<RemoteResult<McpApplyResult>>
   setServerEnabled(workspace: string, name: string, enabled: boolean): Promise<RemoteResult<McpApplyResult>>
   setProfileServerEnabled(entryId: string, enabled: boolean): Promise<RemoteResult<McpApplyResult>>
+  setServerTools(workspace: string, serverName: string, excludeTools: string[]): Promise<RemoteResult<McpApplyResult>>
+  setProfileServerTools(serverName: string, excludeTools: string[]): Promise<RemoteResult<McpApplyResult>>
   versionInfo(): Promise<RemoteResult<McpPluginVersionInfo>>
 }
 
@@ -103,6 +105,20 @@ export async function apply(ctx: ClientContext): Promise<void> {
       const result = await mcpMgr().setProfileServerEnabled(entryId, enabled)
       if (!result.ok) {
         throw new Error(`mcpMgr.setProfileServerEnabled failed: ${result.error.code}: ${result.error.message}`)
+      }
+      return result.value
+    },
+    setServerTools: async (workspace, name, excludeTools) => {
+      const result = await mcpMgr().setServerTools(workspace, name, [...excludeTools])
+      if (!result.ok) {
+        throw new Error(`mcpMgr.setServerTools failed: ${result.error.code}: ${result.error.message}`)
+      }
+      return result.value
+    },
+    setProfileServerTools: async (name, excludeTools) => {
+      const result = await mcpMgr().setProfileServerTools(name, [...excludeTools])
+      if (!result.ok) {
+        throw new Error(`mcpMgr.setProfileServerTools failed: ${result.error.code}: ${result.error.message}`)
       }
       return result.value
     },

@@ -19,11 +19,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, wri
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import { agentWorkspace, collectWorkspaces, hasManagerFile, nativeRealpath } from './discovery.ts'
-import { AgentMounts, type AgentScopeHandle } from './mounts.ts'
-import { draftToEntry, mcpJsonPath, parseMcpJson, SERVER_NAME_PATTERN, validateDraft, type ParsedServer, type ParseResult } from './parse.ts'
+import { AgentMounts, type AgentScopeHandle, type ToolFilter } from './mounts.ts'
+import { draftToEntry, mcpJsonPath, parseMcpJson, parseToolList, SERVER_NAME_PATTERN, validateDraft, type ParsedServer, type ParseResult } from './parse.ts'
+import { parseProfileTools, ProfileRestrictions, profileToolsPath, toolKey } from './restrict.ts'
 import { changeOutcome, isMcpClientEntry, profileServerNames, scanProfileEntries, type LoaderEntryView, type PluginChangeView } from './profile.ts'
 import { createFileWatcher } from './watch.ts'
 import { checkPluginVersion } from './version.ts'
@@ -32,7 +33,9 @@ import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServe
 export type * from './types.ts'
 export { parseMcpJson, mcpJsonPath, expandEnv } from './parse.ts'
 export { AgentMounts } from './mounts.ts'
-export type { AgentScopeHandle, MountHandle, MountsHost, MountsOptions } from './mounts.ts'
+export type { AgentScopeHandle, MountHandle, MountsHost, MountsOptions, ToolFilter } from './mounts.ts'
+export { ProfileRestrictions, parseProfileTools } from './restrict.ts'
+export type { RestrictHost } from './restrict.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-mgr'
@@ -90,16 +93,11 @@ interface HostEvents {
 
 interface ToolsView {
   schemas(scope?: object): readonly { name: string }[]
+  restrict(filter: { deny: readonly string[] }): () => void
+  register(definition: { name: string }): () => void
 }
 
 const EMPTY_PARSE: ParseResult = { servers: [], errors: [] }
-
-/** mcp-client plugin object passed to `ctx.plugin` per server. */
-const MCP_CLIENT_PLUGIN = {
-  name: mcpClient.name,
-  inject: mcpClient.inject,
-  apply: mcpClient.apply,
-}
 
 /**
  * The manager service: owns discovery, per-agent mounts, and the Remote
@@ -108,6 +106,12 @@ const MCP_CLIENT_PLUGIN = {
  */
 export class McpMgrGateway extends TypertRemoteService {
   private readonly mounts: AgentMounts
+  private readonly restrictions: ProfileRestrictions
+  /** `<workspace>#<server>` -> tool names the server listed to any agent. */
+  private readonly toolCatalog = new Map<string, Set<string>>()
+  /** Profile exclusions from `<profileDir>/dshmm/tools.json`. */
+  private profileExclusions = new Map<string, string[]>()
+  private profileToolsText: string | undefined
   private readonly fileWatcher = createFileWatcher(
     (handler, ms) => setTimeout(handler, ms),
     handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -140,8 +144,31 @@ export class McpMgrGateway extends TypertRemoteService {
         }
       },
       isIdle: agent => (agent as AgentView).status !== 'running',
+      toolSeen: (workspace, server, tool) => {
+        const key = `${workspace}#${server}`
+        let tools = this.toolCatalog.get(key)
+        if (tools === undefined) this.toolCatalog.set(key, tools = new Set())
+        tools.add(tool)
+      },
       warn: message => { ctx.logger.warn(message) },
     }, { idleTimeoutMs: config.agentIdleTimeoutMs, mountWaitMs: config.agentMountWaitMs })
+    this.restrictions = new ProfileRestrictions({
+      exclusions: () => this.profileExclusions,
+      globalToolNames: () => this.globalToolNames(),
+      restrict: (agent, deny) => {
+        const tools = getService<ToolsView>((agent as AgentView).ctx, 'tools')
+        if (tools === undefined) throw new Error('tools service unavailable on the agent')
+        return tools.restrict({ deny })
+      },
+      onAgentDispose: (agent, release) => {
+        try {
+          return (agent as AgentView).ctx.effect(() => async () => { release() }, 'mcp-mgr: agent tool restriction')
+        } catch {
+          return undefined
+        }
+      },
+      warn: message => { ctx.logger.warn(message) },
+    })
     const events = ctx as unknown as HostEvents
     // Tools are frozen at assembly: mount before it completes. When
     // registrations changed, a nested assembly yields a fresh base assembly
@@ -154,7 +181,8 @@ export class McpMgrGateway extends TypertRemoteService {
         this.reruns.set(context, assembly)
         return assembly
       }
-      const changed = await this.mounts.turn(agent, signal)
+      const restricted = this.restrictions.apply(agent)
+      const changed = await this.mounts.turn(agent, signal) || restricted
       const systemPrompt = getService<{ assemble(context: object): Promise<unknown> }>(ctx, 'systemPrompt')
       if (!changed || signal.aborted || systemPrompt === undefined || assembly === null || typeof assembly !== 'object') return next()
       const rerun = { ...context }
@@ -184,6 +212,7 @@ export class McpMgrGateway extends TypertRemoteService {
     ctx.effect(() => async () => {
       this.fileWatcher.dispose()
       clearInterval(this.rescanTimer)
+      this.restrictions.dispose()
       await this.mounts.dispose()
     }, 'mcp-mgr: cleanup')
     void this.runRescan()
@@ -203,7 +232,7 @@ export class McpMgrGateway extends TypertRemoteService {
   @Remote('snapshot')
   snapshot(): McpManagerSnapshot {
     return {
-      servers: [...this.workspaceRows(), ...this.profileServers],
+      servers: [...this.workspaceRows(), ...this.profileRows()],
       watchedWorkspaces: [...this.workspaceSet].sort(),
     }
   }
@@ -309,6 +338,75 @@ export class McpMgrGateway extends TypertRemoteService {
    */
   @Remote('setServerEnabled')
   async setServerEnabled(workspace: string, serverName: string, enabled: boolean): Promise<McpApplyResult> {
+    return this.mutateEntry(workspace, serverName, (entry) => {
+      if (enabled) delete entry.enabled
+      else entry.enabled = false
+    })
+  }
+
+  /**
+   * Set the tools of one workspace server hidden from every agent
+   * (`excludeTools` in mcp.json; an empty list removes the field). Agents
+   * remount the server with the new filter at their next turn.
+   */
+  @Remote('setServerTools')
+  async setServerTools(workspace: string, serverName: string, excludeTools: string[]): Promise<McpApplyResult> {
+    const tools = parseToolList(excludeTools)
+    if (tools === undefined) return { ok: false, error: 'excludeTools must be an array of non-empty strings' }
+    return this.mutateEntry(workspace, serverName, (entry) => {
+      if (tools.length === 0) delete entry.excludeTools
+      else entry.excludeTools = tools
+    })
+  }
+
+  /**
+   * Set the tools of one profile-level server hidden from every agent, in
+   * `<profileDir>/dshmm/tools.json`. Applied at each agent's next turn.
+   */
+  @Remote('setProfileServerTools')
+  async setProfileServerTools(serverName: string, excludeTools: string[]): Promise<McpApplyResult> {
+    if (!SERVER_NAME_PATTERN.test(serverName)) return { ok: false, error: `invalid serverName: ${serverName}` }
+    const tools = parseToolList(excludeTools)
+    if (tools === undefined) return { ok: false, error: 'excludeTools must be an array of non-empty strings' }
+    const path = this.profileToolsFile()
+    if (path === undefined) return { ok: false, error: 'no dsh profile is active; profile tool exclusions are unavailable' }
+    const release = await this.acquireMutation(path)
+    try {
+      let document: Record<string, unknown>
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, error: 'tools.json must contain a JSON object' }
+        document = parsed as Record<string, unknown>
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          return { ok: false, error: `unreadable tools.json: ${String(error instanceof Error ? error.message : error)}` }
+        }
+        document = {}
+      }
+      const current = document.excludeTools ?? {}
+      if (current === null || typeof current !== 'object' || Array.isArray(current)) return { ok: false, error: '"excludeTools" must be an object' }
+      const servers = current as Record<string, unknown>
+      if (tools.length === 0) delete servers[serverName]
+      else servers[serverName] = tools
+      if (Object.keys(servers).length === 0) delete document.excludeTools
+      else document.excludeTools = servers
+      try {
+        atomicWriteJson(path, document)
+      } catch (error) {
+        return { ok: false, error: `write failed: ${String(error instanceof Error ? error.message : error)}` }
+      }
+      this.loadProfileTools()
+      return { ok: true }
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * Read-modify-write one server entry of a workspace's mcp.json, then resync.
+   * Resolves only after the resync settles.
+   */
+  private async mutateEntry(workspace: string, serverName: string, mutate: (entry: Record<string, unknown>) => void): Promise<McpApplyResult> {
     if (!SERVER_NAME_PATTERN.test(serverName)) {
       return { ok: false, error: `invalid serverName: ${serverName}` }
     }
@@ -320,31 +418,26 @@ export class McpMgrGateway extends TypertRemoteService {
       if (!hasManagerFile(workspacePath)) {
         return { ok: false, error: `no mcp.json under ${workspacePath}` }
       }
-    try {
-      const document = JSON.parse(readFileSync(path, 'utf8')) as { mcpServers?: Record<string, unknown> }
-      const servers = document.mcpServers
-      if (servers === undefined || typeof servers !== 'object' || Array.isArray(servers)) {
-        return { ok: false, error: 'mcpServers must be an object' }
+      try {
+        const document = JSON.parse(readFileSync(path, 'utf8')) as { mcpServers?: Record<string, unknown> }
+        const servers = document.mcpServers
+        if (servers === undefined || typeof servers !== 'object' || Array.isArray(servers)) {
+          return { ok: false, error: 'mcpServers must be an object' }
+        }
+        const entry = servers[serverName]
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          return { ok: false, error: `serverName "${serverName}" not found in ${workspacePath}` }
+        }
+        mutate(entry as Record<string, unknown>)
+        atomicWriteJson(path, document)
+      } catch (error) {
+        return { ok: false, error: `write failed: ${String(error instanceof Error ? error.message : error)}` }
       }
-      const entry = servers[serverName]
-      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
-        return { ok: false, error: `serverName "${serverName}" not found in ${workspacePath}` }
-      }
-      const entryRecord = entry as Record<string, unknown>
-      if (enabled) {
-        delete entryRecord.enabled
-      } else {
-        entryRecord.enabled = false
-      }
-      atomicWriteJson(path, document)
-    } catch (error) {
-      return { ok: false, error: `write failed: ${String(error instanceof Error ? error.message : error)}` }
-    }
-    // Invalidate the cached parse so the resync below applies the new flag
-    // instead of replaying the pre-write state.
-    this.parseCache.delete(workspacePath)
-    await this.runRescan()
-    return { ok: true }
+      // Invalidate the cached parse so the resync below applies the change
+      // instead of replaying the pre-write state.
+      this.parseCache.delete(workspacePath)
+      await this.runRescan()
+      return { ok: true }
     } finally {
       release()
     }
@@ -428,6 +521,13 @@ export class McpMgrGateway extends TypertRemoteService {
         if (this.parseCache.has(workspace.path)) continue
         this.parseCache.set(workspace.path, this.readWorkspace(workspace.path, true))
       }
+      for (const key of [...this.toolCatalog.keys()]) {
+        const split = key.lastIndexOf('#')
+        const servers = this.parseCache.get(key.slice(0, split))?.servers
+        if (servers?.some(server => server.name === key.slice(split + 1)) !== true) this.toolCatalog.delete(key)
+      }
+      const profileTools = this.loadProfileTools()
+      if (profileTools !== undefined) watchFiles.push(profileTools)
       this.fileWatcher.setWatchFiles(watchFiles, () => {
         this.parseCache.clear()
         void this.runRescan()
@@ -441,6 +541,57 @@ export class McpMgrGateway extends TypertRemoteService {
     } finally {
       this.rescanning = false
     }
+  }
+
+  /** `<profileDir>/dshmm/tools.json` of the running profile, if any. */
+  private profileToolsFile(): string | undefined {
+    const dir = getService<{ dir?: string }>(this.ctx, 'profileContext')?.dir
+    return typeof dir === 'string' && dir.length > 0 ? profileToolsPath(dir) : undefined
+  }
+
+  /**
+   * Re-read the profile exclusions; errors are warned once per file content.
+   * @returns the file path when it exists (to watch it).
+   */
+  private loadProfileTools(): string | undefined {
+    const path = this.profileToolsFile()
+    let text: string | undefined
+    try {
+      if (path !== undefined) text = readFileSync(path, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.ctx.logger.warn(`mcp-mgr: cannot read ${path}: ${String(error)}`)
+    }
+    if (text === this.profileToolsText) return text === undefined ? undefined : path
+    this.profileToolsText = text
+    if (text === undefined) {
+      this.profileExclusions = new Map()
+      return undefined
+    }
+    const parsed = parseProfileTools(text)
+    for (const error of parsed.errors) this.ctx.logger.warn(`mcp-mgr: ${path}: ${error}`)
+    this.profileExclusions = parsed.exclusions
+    return path
+  }
+
+  /** Names of the global tool layer (where profile-level servers register). */
+  private globalToolNames(): string[] {
+    const tools = getService<ToolsView>(this.ctx, 'tools')
+    if (tools === undefined) return []
+    try {
+      return tools.schemas().map(schema => schema.name)
+    } catch {
+      return []
+    }
+  }
+
+  /** Profile rows with their global tools and exclusions. */
+  private profileRows(): McpServerState[] {
+    const names = this.globalToolNames()
+    return this.profileServers.map((row) => {
+      const excluded = this.profileExclusions.get(row.name) ?? []
+      const listed = names.flatMap(name => toolKey(row.name, name) ?? [])
+      return { ...row, ...toolFields(listed, excluded) }
+    })
   }
 
   /** Loader entries when the loader service is mounted (web profile). */
@@ -487,6 +638,7 @@ export class McpMgrGateway extends TypertRemoteService {
           liveAgents: status === 'configured' ? this.mounts.liveAgents(workspace, server.name) : 0,
           connectedAgents,
           ...(lastError === undefined ? {} : { lastError }),
+          ...toolFields(this.toolCatalog.get(`${workspace}#${server.name}`) ?? [], server.excludeTools),
         })
       }
       for (const error of parsed.errors) {
@@ -529,9 +681,18 @@ interface PluginManagerView {
   setPluginEnabled(id: string, enabled: boolean): Promise<PluginChangeView>
 }
 
+/** Snapshot tool fields: every known name (excluded included) and the exclusions, omitted when empty. */
+function toolFields(listed: Iterable<string>, excluded: readonly string[]): Pick<McpServerState, 'tools' | 'excludedTools'> {
+  const tools = [...new Set([...listed, ...excluded])].sort()
+  return {
+    ...(tools.length === 0 ? {} : { tools }),
+    ...(excluded.length === 0 ? {} : { excludedTools: [...excluded] }),
+  }
+}
+
 function atomicWriteJson(path: string, document: unknown): void {
   mkdirSync(dirname(path), { recursive: true })
-  const tmp = join(dirname(path), `.mcp.json.tmp-${process.pid}-${randomUUID()}`)
+  const tmp = join(dirname(path), `.${basename(path)}.tmp-${process.pid}-${randomUUID()}`)
   try {
     writeFileSync(tmp, `${JSON.stringify(document, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     chmodSync(tmp, 0o600)
@@ -561,8 +722,13 @@ function toolNames(tools: ToolsView, agent: object): string[] {
 function openAgentScope(ctx: Context, agent: object): AgentScopeHandle {
   const scope = createScope(ctx, agent)
   return {
-    mount: (config) => {
-      const fiber = scope.ctx.plugin(MCP_CLIENT_PLUGIN, viaStdioShim(config)) as unknown as FiberView
+    mount: (config, filter) => {
+      const plugin = {
+        name: mcpClient.name,
+        inject: mcpClient.inject,
+        apply: async (pluginCtx: Context, resolved: typeof config) => mcpClient.apply(withToolFilter(pluginCtx, resolved.serverName, filter), resolved),
+      }
+      const fiber = scope.ctx.plugin(plugin, viaStdioShim(config)) as unknown as FiberView
       return {
         ready: fiber.await().then(() => undefined),
         dispose: async () => {
@@ -592,6 +758,27 @@ function resolveStdioShim(): { script: string; spawnModule: string } | undefined
 function viaStdioShim(config: McpClientConfig): McpClientConfig {
   if (config.transport !== 'stdio' || STDIO_SHIM === undefined) return config
   return { ...config, command: process.execPath, args: [STDIO_SHIM.script, STDIO_SHIM.spawnModule, config.command, ...config.args] }
+}
+
+/**
+ * The mcp-client's context with `tools.register` filtered: excluded tools are
+ * never registered, so they never reach the agent's prompt. Everything else
+ * reads through to the real context with the original receiver.
+ */
+function withToolFilter(ctx: Context, serverName: string, filter: ToolFilter): Context {
+  const tools = {
+    register: (definition: { name: string }): (() => void) => {
+      const tool = toolKey(serverName, definition.name)
+      if (tool !== undefined) {
+        filter.seen(tool)
+        if (filter.exclude.has(tool)) return () => {}
+      }
+      return (ctx as unknown as { tools: ToolsView }).tools.register(definition)
+    },
+  }
+  return new Proxy(ctx, {
+    get: (target, key, receiver) => key === 'tools' ? tools : Reflect.get(target, key, receiver),
+  })
 }
 
 interface FiberView {

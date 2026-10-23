@@ -70,6 +70,7 @@ Rules:
 - A stdio server without `cwd` uses the workspace root.
 - `serverName` must be unique within one mcp.json; the same name may be used in other workspaces. A name equal to a profile-level mcp-client server is shown as `conflict` and never mounted.
 - Set `"enabled": false` to disable an entry without removing it; absent means enabled.
+- Set `"excludeTools": ["<tool>", ...]` to hide some of a server's tools from every agent (they are never registered, so they never reach the prompt). Tool names are the part after `mcp__<serverName>__`, which is the server's own name unless it contains characters outside `[A-Za-z0-9_-]`.
 
 ## Behavior and limits
 
@@ -84,6 +85,7 @@ Rules:
 - Compatibility: requires `dsh-preset-tool-access` **>= 0.2.1** (earlier versions' `restrict` throws on agent-scoped tool names and drops their denials).
 - Settings shows per workspace server: config status (`configured` / `disabled` / `conflict` / `error`), running agents, connected agents (tools visible), and the last error.
 - Profile-level servers (mcp-client rows from bundles or the profile `cordis.patch.yml`) can be disabled and re-enabled in Settings. The change goes through the host plugin manager, which writes a `disabled` override into the profile `cordis.patch.yml` and applies it live to every session. Rows the plugin manager cannot address (inside a group, duplicate id) report why.
+- Per-tool selection: each row's **Tools** button lists the server's tools with a checkbox each. Workspace servers save to `excludeTools` in mcp.json and remount with it at each agent's next turn; their list appears once an agent has used the server. Profile-level servers save to `<profileDir>/dshmm/tools.json` (`{ "excludeTools": { "<serverName>": ["<tool>"] } }`, hand-editable) and are hidden per agent with `tools.restrict` at its next turn; unloading this plugin lifts those restrictions.
 - On Windows, prefer launching stdio servers with `node` directly: teardown kills only the direct child, so `cmd /c npx …` wrappers can leave orphaned processes.
 
 ### Plugin configuration
