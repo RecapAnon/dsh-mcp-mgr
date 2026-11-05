@@ -1,108 +1,98 @@
-/**
- * Per-agent lazy mounts of a workspace's MCP servers.
- *
- * An agent's workspace servers mount into an agent-keyed scope at turn
- * assembly, stop after an idle timeout, and are disposed with the agent, on
- * config removal, or when the manager closes. Host access is injected so the
- * lifecycle runs without a real host in tests.
- * @module dsh-mcp-mgr/mounts
- */
-
+/** Workspace-owned MCP backends with lightweight, agent-scoped bindings. */
 import type { Config as McpClientConfig } from '@deepseek-ai/dsh-mcp-client'
 import type { ParsedServer } from './parse.ts'
 
-/** One mounted mcp-client instance. */
 export interface MountHandle {
-  /** Settles once the instance activated (initial connect + tool discovery). */
   readonly ready: Promise<void>
   dispose(): Promise<void>
 }
 
-/** Registration-time tool filter of one mount. */
 export interface ToolFilter {
-  /** Tool names (public name without `mcp__<serverName>__`) never registered. */
   readonly exclude: ReadonlySet<string>
-  /** Called for every tool the server lists, excluded or not. */
   seen(tool: string): void
 }
 
-/** An agent-keyed registration scope. */
+/** Legacy integration seam retained for consumers of the exported type. */
 export interface AgentScopeHandle {
   mount(config: McpClientConfig, filter: ToolFilter): MountHandle
   dispose(): Promise<void>
 }
 
-/** Host seams used by {@link AgentMounts}. */
+export interface AgentBindingHandle {
+  update(exclude: ReadonlySet<string>): boolean | void
+  dispose(): Promise<void>
+}
+
+export interface SharedMountHandle extends MountHandle {
+  bind(agent: object, exclude: ReadonlySet<string>): AgentBindingHandle
+}
+
 export interface MountsHost {
-  /** The registered workspace the agent belongs to, if any. */
   workspaceOf(agent: object): string | undefined
-  /** Enabled, non-conflict servers of a workspace in mcp.json order. */
   candidates(workspace: string): readonly ParsedServer[]
-  openScope(agent: object): AgentScopeHandle
-  /** Run `release` when the agent is disposed; undefined when the agent is already inactive. */
+  openServer(config: McpClientConfig, seen: (tool: string) => void): SharedMountHandle
   onAgentDispose(agent: object, release: () => Promise<void>): (() => void) | undefined
   isIdle(agent: object): boolean
-  /** A server of the workspace listed `tool` (excluded or not). */
   toolSeen(workspace: string, server: string, tool: string): void
   warn(message: string): void
 }
 
 export interface MountsOptions {
+  /** Deprecated: backends stay warm until their workspace/configuration is removed. */
   readonly idleTimeoutMs: number
   readonly mountWaitMs: number
 }
 
 interface Live {
-  /** Config plus tool filter; a different fingerprint remounts. */
+  readonly workspace: string
+  readonly name: string
+  readonly owner: object | undefined
   readonly fingerprint: string
-  readonly handle: MountHandle
+  readonly handle: SharedMountHandle
+  ready: Promise<void>
   settled: boolean
   failed: boolean
-  ready?: Promise<void>
+  stopping?: Promise<void>
+}
+
+interface Attachment {
+  readonly live: Live
+  readonly binding: AgentBindingHandle
+  exclusions: string
 }
 
 interface AgentState {
   readonly agent: object
   workspace: string | undefined
-  scope: AgentScopeHandle | undefined
-  readonly servers: Map<string, Live>
-  /** Bumped whenever this agent's registrations change. */
+  readonly servers: Map<string, Attachment>
   generation: number
-  /** Serializes reconcile and stop work. */
   chain: Promise<unknown>
   pass: Promise<Pass> | undefined
-  /** Mount wait deadline of the current activity. */
   deadline: number | undefined
-  idleTimer: ReturnType<typeof setTimeout> | undefined
   unhook: () => void
 }
 
 interface Pass {
   readonly done: Promise<void>
 }
-
 const SETTLED: Pass = { done: Promise.resolve() }
 
 export class AgentMounts {
   private readonly states = new Map<object, AgentState>()
-  private readonly mountErrors = new Map<string, string>()
+  private readonly pool = new Map<string, Map<string, Live>>()
+  private readonly backends = new Set<Live>()
+  private readonly mountErrors = new Map<string, Map<string, string>>()
   private closed = false
 
   constructor(private readonly host: MountsHost, private readonly options: MountsOptions) {}
 
-  /**
-   * Reconcile the agent's mounts for one turn assembly and wait for them, at
-   * most until the activity's mount deadline or `signal` aborts. Work past
-   * that point continues in the background.
-   * @returns whether the agent's registrations changed meanwhile.
-   */
+  /** Cancellation ends only this wait, never the shared startup. */
   async turn(agent: object, signal?: AbortSignal): Promise<boolean> {
     const state = this.stateOf(agent)
     if (state === undefined) return false
-    this.clearIdle(state)
     const start = state.generation
     const deadline = state.deadline ??= Date.now() + this.options.mountWaitMs
-    state.pass ??= this.runPass(state)
+    state.pass ??= this.locked(state, () => this.runPass(state))
       .catch((error: unknown) => {
         this.host.warn(`mcp-mgr: mount failed: ${message(error)}`)
         return SETTLED
@@ -112,65 +102,50 @@ export class AgentMounts {
     return state.generation !== start
   }
 
-  /** Track `agent/status`: idle arms the idle stop, running clears it. */
-  status(agent: object, status: string): void {
+  status(agent: object, _status: string): void {
+    const state = this.states.get(agent)
+    if (state !== undefined) state.deadline = undefined
+  }
+
+  /** Invalidated backends stop once for all subscribers; filter-only edits stay warm. */
+  async configChanged(workspace: string): Promise<void> {
+    const wanted = new Map(this.host.candidates(workspace).map(server => [server.name, server]))
+    const errors = this.mountErrors.get(workspace)
+    for (const name of errors?.keys() ?? []) if (!wanted.has(name)) errors?.delete(name)
+    await Promise.all([...this.backends].filter(live => live.workspace === workspace &&
+      live.fingerprint !== fingerprintOf(wanted.get(live.name))).map(live => this.stopLive(live)))
+  }
+
+  async workspaceRemoved(workspace: string): Promise<void> {
+    this.mountErrors.delete(workspace)
+    await Promise.all([...this.backends].filter(live => live.workspace === workspace).map(live => this.stopLive(live)))
+  }
+
+  async release(agent: object): Promise<void> {
     const state = this.states.get(agent)
     if (state === undefined) return
-    state.deadline = undefined
-    if (status === 'idle') this.armIdle(state)
-    else this.clearIdle(state)
-  }
-
-  /** Stop, on every agent of the workspace, servers that are no longer candidates. */
-  async configChanged(workspace: string): Promise<void> {
-    const names = new Set(this.host.candidates(workspace).map(server => server.name))
-    this.clearErrors(workspace, name => !names.has(name))
-    await Promise.all(this.statesIn(workspace).map(state => this.locked(state, () =>
-      this.stop(state, [...state.servers.keys()].filter(name => !names.has(name))))))
-  }
-
-  /** Stop every agent mount of a removed workspace. */
-  async workspaceRemoved(workspace: string): Promise<void> {
-    this.clearErrors(workspace, () => true)
-    await Promise.all(this.statesIn(workspace).map(state => this.locked(state, () =>
-      this.stop(state, [...state.servers.keys()]))))
-  }
-
-  /** Forget an agent and dispose its mounts. */
-  release(agent: object): Promise<void> {
-    const state = this.states.get(agent)
-    if (state === undefined) return Promise.resolve()
     this.states.delete(agent)
-    this.clearIdle(state)
-    return this.locked(state, () => this.stop(state, [...state.servers.keys()]))
+    try { state.unhook() } catch { /* the agent may already be disposing */ }
+    // Do not queue behind a startup that may never finish.
+    await Promise.all([...state.servers.keys()].map(name => this.detach(state, name)))
   }
 
-  /** Dispose every agent mount; later turns mount nothing. */
   async dispose(): Promise<void> {
     this.closed = true
-    await Promise.all([...this.states.values()].map((state) => {
-      const stopped = this.release(state.agent)
-      try { state.unhook() } catch { /* agent already inactive */ }
-      return stopped
-    }))
+    await Promise.all([...this.states.keys()].map(agent => this.release(agent)))
+    await Promise.all([...this.backends].map(live => this.stopLive(live)))
   }
 
-  /** Agents currently resolved to the workspace. */
   agentsIn(workspace: string): object[] {
-    return this.statesIn(workspace).map(state => state.agent)
+    return [...this.states.values()].filter(state => state.workspace === workspace).map(state => state.agent)
   }
 
-  /** Agents of the workspace holding a mount of `name`. */
   liveAgents(workspace: string, name: string): number {
-    return this.statesIn(workspace).filter(state => state.servers.has(name)).length
+    return [...this.states.values()].filter(state => state.workspace === workspace && state.servers.has(name)).length
   }
 
   lastError(workspace: string, name: string): string | undefined {
-    return this.mountErrors.get(`${workspace}#${name}`)
-  }
-
-  private statesIn(workspace: string): AgentState[] {
-    return [...this.states.values()].filter(state => state.workspace === workspace)
+    return this.mountErrors.get(workspace)?.get(name)
   }
 
   private stateOf(agent: object): AgentState | undefined {
@@ -179,16 +154,8 @@ export class AgentMounts {
     const unhook = this.host.onAgentDispose(agent, () => this.release(agent))
     if (unhook === undefined) return undefined
     const state: AgentState = {
-      agent,
-      workspace: undefined,
-      scope: undefined,
-      servers: new Map(),
-      generation: 0,
-      chain: Promise.resolve(),
-      pass: undefined,
-      deadline: undefined,
-      idleTimer: undefined,
-      unhook,
+      agent, workspace: undefined, servers: new Map(), generation: 0,
+      chain: Promise.resolve(), pass: undefined, deadline: undefined, unhook,
     }
     this.states.set(agent, state)
     return state
@@ -198,115 +165,124 @@ export class AgentMounts {
     return !this.closed && this.states.get(state.agent) === state
   }
 
-  private runPass(state: AgentState): Promise<Pass> {
-    return this.locked(state, async (): Promise<Pass> => {
-      if (!this.alive(state)) return SETTLED
-      const workspace = this.host.workspaceOf(state.agent)
-      if (workspace !== state.workspace) {
-        await this.stop(state, [...state.servers.keys()])
-        state.workspace = workspace
+  private async runPass(state: AgentState): Promise<Pass> {
+    if (!this.alive(state)) return SETTLED
+    const workspace = this.host.workspaceOf(state.agent)
+    if (workspace !== state.workspace) {
+      await Promise.all([...state.servers.keys()].map(name => this.detach(state, name)))
+      state.workspace = workspace
+    }
+    if (workspace === undefined || !this.alive(state)) return SETTLED
+    const wanted = this.host.candidates(workspace)
+    const byName = new Map(wanted.map(server => [server.name, server]))
+    await Promise.all([...state.servers].filter(([name]) => !byName.has(name)).map(([name]) => this.detach(state, name)))
+    const passes = await Promise.all(wanted.map(server => this.ensure(state, workspace, server)))
+    return { done: Promise.all(passes.map(pass => pass.done)).then(() => undefined) }
+  }
+
+  private async ensure(state: AgentState, workspace: string, server: ParsedServer): Promise<Pass> {
+    const fingerprint = fingerprintOf(server)
+    let attachment = state.servers.get(server.name)
+    if (attachment !== undefined && (attachment.live.failed || attachment.live.fingerprint !== fingerprint)) {
+      await this.stopLive(attachment.live)
+      attachment = undefined
+    }
+    const shared = server.scope !== 'agent'
+    let live = attachment?.live ?? (shared ? this.pool.get(workspace)?.get(server.name) : undefined)
+    while (live !== undefined && (live.failed || live.stopping !== undefined || live.fingerprint !== fingerprint)) {
+      await this.stopLive(live)
+      live = shared ? this.pool.get(workspace)?.get(server.name) : undefined
+      attachment = state.servers.get(server.name)
+    }
+    if (!this.alive(state) || this.host.workspaceOf(state.agent) !== workspace ||
+      !this.host.candidates(workspace).some(candidate => candidate.name === server.name && fingerprintOf(candidate) === fingerprint)) return SETTLED
+    if (live === undefined) {
+      try {
+        const handle = this.host.openServer(server.config, tool => { this.host.toolSeen(workspace, server.name, tool) })
+        live = { workspace, name: server.name, owner: shared ? undefined : state.agent,
+          fingerprint, handle, ready: Promise.resolve(), settled: false, failed: false }
+        this.backends.add(live)
+        if (shared) {
+          let servers = this.pool.get(workspace)
+          if (servers === undefined) this.pool.set(workspace, servers = new Map())
+          servers.set(server.name, live)
+        }
+        const current = live
+        current.ready = handle.ready.then(() => {
+          current.settled = true
+          if (current.stopping !== undefined) return
+          this.mountErrors.get(workspace)?.delete(server.name)
+          for (const subscriber of this.states.values()) {
+            if (subscriber.servers.get(server.name)?.live === current) subscriber.generation += 1
+          }
+        }, async (error: unknown) => {
+          current.failed = true
+          current.settled = true
+          if (current.stopping !== undefined) return
+          this.mountFailed(workspace, server.name, error)
+          await this.stopLive(current)
+        })
+      } catch (error) {
+        this.mountFailed(workspace, server.name, error)
+        return SETTLED
       }
-      if (workspace === undefined) return SETTLED
-      const wanted = this.host.candidates(workspace)
-      const byName = new Map(wanted.map(server => [server.name, server]))
-      await this.stop(state, [...state.servers]
-        .filter(([name, live]) => live.failed || live.fingerprint !== fingerprintOf(byName.get(name)))
-        .map(([name]) => name))
-      if (!this.alive(state)) return SETTLED
-      const done = Promise.all(wanted.map(server => this.ensure(state, workspace, server))).then(() => undefined)
-      if (state.servers.size === 0) await this.stop(state, [])
-      return { done }
-    })
-  }
-
-  private ensure(state: AgentState, workspace: string, server: ParsedServer): Promise<void> {
-    const existing = state.servers.get(server.name)
-    if (existing !== undefined) return existing.settled ? Promise.resolve() : existing.ready ?? Promise.resolve()
-    const key = `${workspace}#${server.name}`
-    let handle: MountHandle
+    }
     try {
-      state.scope ??= this.host.openScope(state.agent)
-      handle = state.scope.mount(server.config, {
-        exclude: new Set(server.excludeTools),
-        seen: tool => { this.host.toolSeen(workspace, server.name, tool) },
-      })
+      const exclusions = JSON.stringify(server.excludeTools)
+      if (attachment === undefined || attachment.live !== live) {
+        const binding = live.handle.bind(state.agent, new Set(server.excludeTools))
+        state.servers.set(server.name, { live, binding, exclusions })
+        if (live.settled) state.generation += 1
+      } else {
+        const repaired = attachment.binding.update(new Set(server.excludeTools)) === true
+        if (attachment.exclusions !== exclusions || repaired) state.generation += 1
+        attachment.exclusions = exclusions
+      }
+      return { done: live.ready }
     } catch (error) {
-      this.mountFailed(key, error)
-      return Promise.resolve()
+      this.host.warn(`mcp-mgr: ${workspace}#${server.name}: agent binding failed: ${message(error)}`)
+      if (live.owner === state.agent) await this.stopLive(live)
+      return SETTLED
     }
-    const live: Live = { fingerprint: fingerprintOf(server), handle, settled: false, failed: false }
-    state.servers.set(server.name, live)
-    live.ready = handle.ready.then(() => {
-      live.settled = true
-      if (state.servers.get(server.name) !== live) return
-      this.mountErrors.delete(key)
-      state.generation += 1
-      if (this.host.isIdle(state.agent)) this.armIdle(state)
-    }, (error: unknown) => {
-      live.settled = true
-      live.failed = true
-      if (state.servers.get(server.name) !== live) return
-      this.mountFailed(key, error)
-      void this.locked(state, async () => {
-        if (state.servers.get(server.name) === live) await this.stop(state, [server.name])
-      })
-    })
-    return live.ready
   }
 
-  /** Record a mount failure; warn only when the error for the key changes. */
-  private mountFailed(key: string, error: unknown): void {
+  private async detach(state: AgentState, name: string): Promise<void> {
+    const attachment = state.servers.get(name)
+    if (attachment === undefined) return
+    state.servers.delete(name)
+    state.generation += 1
+    await attachment.binding.dispose().catch(error => { this.host.warn(`mcp-mgr: binding dispose failed: ${message(error)}`) })
+    if (attachment.live.owner === state.agent) await this.stopLive(attachment.live)
+  }
+
+  private stopLive(live: Live): Promise<void> {
+    if (live.stopping !== undefined) return live.stopping
+    // Publish the shutdown barrier before any binding/transport disposer runs.
+    live.stopping = Promise.resolve().then(async () => {
+      await Promise.all([...this.states.values()].map(async state => {
+        const attachment = state.servers.get(live.name)
+        if (attachment?.live !== live) return
+        state.servers.delete(live.name)
+        if (!live.failed) state.generation += 1
+        await attachment.binding.dispose().catch(error => { this.host.warn(`mcp-mgr: binding dispose failed: ${message(error)}`) })
+      }))
+      await live.handle.dispose()
+    }).catch(error => { this.host.warn(`mcp-mgr: dispose failed: ${message(error)}`) }).finally(() => {
+      this.backends.delete(live)
+      const servers = this.pool.get(live.workspace)
+      if (servers?.get(live.name) === live) servers.delete(live.name)
+      if (servers?.size === 0) this.pool.delete(live.workspace)
+    })
+    return live.stopping
+  }
+
+  private mountFailed(workspace: string, name: string, error: unknown): void {
     const text = message(error)
-    if (this.mountErrors.get(key) === text) return
-    this.mountErrors.set(key, text)
-    this.host.warn(`mcp-mgr: ${key}: mount failed: ${text}`)
-  }
-
-  private clearErrors(workspace: string, matches: (name: string) => boolean): void {
-    const prefix = `${workspace}#`
-    for (const key of [...this.mountErrors.keys()]) {
-      if (key.startsWith(prefix) && matches(key.slice(prefix.length))) this.mountErrors.delete(key)
-    }
-  }
-
-  private async stop(state: AgentState, names: readonly string[]): Promise<void> {
-    const removed: Live[] = []
-    for (const name of names) {
-      const live = state.servers.get(name)
-      if (live === undefined) continue
-      state.servers.delete(name)
-      removed.push(live)
-    }
-    await Promise.all(removed.map(live => live.handle.dispose().catch((error: unknown) => {
-      this.host.warn(`mcp-mgr: dispose failed: ${message(error)}`)
-    })))
-    // A failed startup has already unloaded its registrations.
-    if (removed.some(live => !live.failed)) state.generation += 1
-    if (state.servers.size > 0) return
-    this.clearIdle(state)
-    const scope = state.scope
-    state.scope = undefined
-    await scope?.dispose().catch((error: unknown) => {
-      this.host.warn(`mcp-mgr: scope dispose failed: ${message(error)}`)
-    })
-  }
-
-  private armIdle(state: AgentState): void {
-    if (state.idleTimer !== undefined || state.servers.size === 0 || !this.alive(state)) return
-    state.idleTimer = setTimeout(() => {
-      state.idleTimer = undefined
-      if (!this.alive(state) || !this.host.isIdle(state.agent)) return
-      void this.locked(state, async () => {
-        if (this.host.isIdle(state.agent)) await this.stop(state, [...state.servers.keys()])
-      })
-    }, this.options.idleTimeoutMs)
-    state.idleTimer.unref?.()
-  }
-
-  private clearIdle(state: AgentState): void {
-    if (state.idleTimer === undefined) return
-    clearTimeout(state.idleTimer)
-    state.idleTimer = undefined
+    let errors = this.mountErrors.get(workspace)
+    if (errors === undefined) this.mountErrors.set(workspace, errors = new Map())
+    if (errors.get(name) === text) return
+    errors.set(name, text)
+    this.host.warn(`mcp-mgr: ${workspace}#${name}: mount failed: ${text}`)
   }
 
   private locked<T>(state: AgentState, run: () => Promise<T>): Promise<T> {
@@ -319,14 +295,13 @@ export class AgentMounts {
 function fingerprintOf(server: ParsedServer): string
 function fingerprintOf(server: ParsedServer | undefined): string | undefined
 function fingerprintOf(server: ParsedServer | undefined): string | undefined {
-  return server === undefined ? undefined : JSON.stringify([server.config, server.excludeTools])
+  return server === undefined ? undefined : JSON.stringify([server.config, server.scope ?? 'workspace'])
 }
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** Resolve when `done` settles, the deadline passes or `signal` aborts. */
 function settleBy(done: Promise<unknown>, deadline: number, signal?: AbortSignal): Promise<void> {
   const remaining = deadline - Date.now()
   if (remaining <= 0 || signal?.aborted === true) return Promise.resolve()

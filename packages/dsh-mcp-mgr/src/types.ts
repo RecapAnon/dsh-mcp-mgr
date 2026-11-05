@@ -35,7 +35,7 @@ export interface McpServerState {
   readonly status: McpServerStatus
   /** Why the row is `error` / `conflict`. */
   readonly error?: string
-  /** Workspace rows only: agents that currently hold a mount of this server. */
+  /** Workspace rows only: agents holding a binding (not the backend process count). */
   readonly liveAgents?: number
   /** Workspace rows only: agents whose tool view contains `mcp__<name>__*`. */
   readonly connectedAgents?: number

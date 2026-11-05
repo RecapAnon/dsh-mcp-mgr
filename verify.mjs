@@ -1,7 +1,7 @@
 /**
  * dsh-mcp-mgr verification with a fake host:
  *  1. parse mcp.json documents (incl. ${VAR} expansion and rejections)
- *  2. per-agent mounts: lazy mount, wait cap, abort, idle stop, config changes, conflicts, failures; workspace resolution
+ *  2. pooled mounts: shared startup, agent bindings, wait cap, abort, warm lifetime, config changes, failures; workspace resolution
  *  3. Remote artifact shape (strict codecs) and strict-mode removal
  *  4. real Typert registry mount of the generated contribution
  */
@@ -34,6 +34,10 @@ console.log('parse:')
       brokenEnv: { type: 'stdio', command: 'x', env: { K: '${MCP_TEST_MISSING_VAR}' } },
       trimmed: { type: 'http', url: 'http://x/mcp', excludeTools: ['pdf', 'html', 'pdf'] },
       badTools: { type: 'http', url: 'http://x/mcp', excludeTools: 'pdf' },
+      isolated: { type: 'stdio', command: 'node', scope: 'agent' },
+      shared: { type: 'http', url: 'http://x/mcp', scope: 'workspace' },
+      badScope: { type: 'stdio', command: 'node', scope: 'global' },
+      nullScope: { type: 'stdio', command: 'node', scope: null },
     },
   })
   process.env.MCP_TEST_TOKEN = 'tok-123'
@@ -54,82 +58,79 @@ console.log('parse:')
   check('excludeTools defaults to empty', parsed.servers.find(s => s.name === 'memory')?.excludeTools.length === 0)
   check('non-array excludeTools rejected', parsed.errors.some(e => e.name === 'badTools'))
   check('agent mounts fail on startup error', parsed.servers.every(s => s.config.failOnStartupError === true))
+  check('workspace sharing is the parser default', parsed.servers.find(s => s.name === 'memory')?.scope === 'workspace')
+  check('explicit agent and workspace scopes are retained', parsed.servers.find(s => s.name === 'isolated')?.scope === 'agent' && parsed.servers.find(s => s.name === 'shared')?.scope === 'workspace')
+  check('unknown and null scopes are rejected', ['badScope', 'nullScope'].every(name => parsed.errors.some(e => e.name === name)))
   delete process.env.MCP_TEST_TOKEN
 }
 
-// ── 2. per-agent mounts (fake host) ─────────────────────────────────────────
-console.log('agent mounts:')
+// ── 2. pooled mounts (fake host) ────────────────────────────────────────────
+console.log('pooled mounts:')
 {
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-  const srv = (name, extra = {}) => ({ name, enabled: extra.enabled ?? true, excludeTools: extra.excludeTools ?? [], config: { transport: 'stdio', serverName: name, command: extra.command ?? 'x', args: [], env: {}, cwd: '/ws', toolCallTimeoutMs: 60000, failOnStartupError: true } })
+  const flush = () => new Promise(resolve => setImmediate(resolve))
+  const deferred = () => {
+    let resolve
+    const promise = new Promise(done => { resolve = done })
+    return { promise, resolve }
+  }
+  const srv = (name, extra = {}) => ({
+    name, enabled: extra.enabled ?? true, excludeTools: extra.excludeTools ?? [],
+    ...(extra.scope === undefined ? {} : { scope: extra.scope }),
+    config: { transport: 'stdio', serverName: name, command: extra.command ?? 'x', args: [], env: {}, cwd: extra.cwd ?? '/ws', toolCallTimeoutMs: 60000, failOnStartupError: true },
+  })
   function harness(options = {}) {
     const h = {
-      config: options.config ?? {},
-      reserved: new Set(options.reserved ?? []),
-      hang: new Set(options.hang ?? []),
-      gates: new Map(),
-      fail: new Map(Object.entries(options.fail ?? {})),
-      disposeMs: new Map(Object.entries(options.disposeMs ?? {})),
-      started: [],
-      disposed: [],
-      live: new Set(),
-      clashes: 0,
-      scopes: 0,
-      warnings: [],
-      visible: new Map(),
-      filters: new Map(),
-      seen: [],
+      config: options.config ?? {}, reserved: new Set(options.reserved ?? []),
+      hang: new Set(options.hang ?? []), fail: new Map(Object.entries(options.fail ?? {})),
+      backends: [], bindings: [], warnings: [], seen: [],
     }
-    h.see = agent => [...(h.visible.get(agent) ?? [])].sort()
-    h.open = (name) => {
+    h.see = agent => h.bindings.filter(b => b.agent === agent && !b.disposed && b.backend.connected && !b.backend.disposed).map(b => b.backend.name).sort()
+    h.binding = (agent, name) => h.bindings.findLast(b => b.agent === agent && b.backend.name === name && !b.disposed)
+    h.open = name => {
       h.hang.delete(name)
-      for (const release of h.gates.get(name) ?? []) release()
-      h.gates.delete(name)
+      for (const backend of h.backends.filter(b => b.name === name)) backend.gate.resolve()
     }
+    h.live = () => h.backends.filter(b => !b.disposed)
     h.host = {
       workspaceOf: agent => (agent.cwd in h.config ? agent.cwd : undefined),
       candidates: ws => (h.config[ws] ?? []).filter(s => s.enabled && !h.reserved.has(s.name)),
-      openScope: (agent) => {
-        h.scopes += 1
+      openServer: (config, seen) => {
+        const backend = { name: config.serverName, config, gate: deferred(), connected: false, disposed: false, disposeCalls: 0, counter: 0 }
+        h.backends.push(backend)
+        if (!h.hang.has(backend.name)) backend.gate.resolve()
+        const ready = backend.gate.promise.then(() => {
+          if (backend.disposed) return
+          if (h.fail.has(backend.name)) throw new Error(h.fail.get(backend.name))
+          backend.connected = true
+          seen('t1')
+          seen('t2')
+        })
         return {
-          mount: (config, filter) => {
-            const name = config.serverName
-            h.filters.set(`${agent.id}:${name}`, [...filter.exclude].sort().join())
-            filter.seen('t1')
-            const id = `${agent.id}:${name}`
-            h.started.push(id)
-            if (h.live.has(id)) h.clashes += 1
-            h.live.add(id)
-            let disposed = false
-            let release
-            const gate = h.hang.has(name)
-              ? new Promise((resolve) => { release = resolve; h.gates.set(name, [...(h.gates.get(name) ?? []), resolve]) })
-              : sleep(5)
-            // Like mcp-client: a failed first connect rejects only with
-            // failOnStartupError, after the fiber unloaded (reservation released).
-            const ready = gate.then(() => {
-              if (disposed) return
-              if (h.fail.has(name)) {
-                if (!config.failOnStartupError) return
-                h.live.delete(id)
-                throw new Error(h.fail.get(name))
-              }
-              if (!h.visible.has(agent)) h.visible.set(agent, new Set())
-              h.visible.get(agent).add(name)
-            })
+          ready,
+          bind: (agent, exclude) => {
+            const binding = { agent, backend, exclude: new Set(exclude), updates: 0, disposed: false, disposeCalls: 0 }
+            h.bindings.push(binding)
+            // A small request proxy proves bindings share backend state, not just a startup count.
+            binding.call = async (gate = Promise.resolve()) => {
+              await gate
+              if (binding.disposed || backend.disposed || !backend.connected) throw new Error('disconnected')
+              return ++backend.counter
+            }
             return {
-              ready,
-              dispose: async () => {
-                disposed = true
-                release?.()
-                await sleep(h.disposeMs.get(name) ?? 0)
-                h.visible.get(agent)?.delete(name)
-                h.live.delete(id)
-                h.disposed.push(id)
+              update: next => {
+                if ([...next].sort().join() !== [...binding.exclude].sort().join()) binding.updates += 1
+                binding.exclude = new Set(next)
               },
+              dispose: async () => { binding.disposeCalls += 1; binding.disposed = true },
             }
           },
-          dispose: async () => { h.scopes -= 1 },
+          dispose: async () => {
+            backend.disposeCalls += 1
+            await backend.disposeGate?.promise
+            backend.disposed = true
+            backend.connected = false
+            backend.gate.resolve()
+          },
         }
       },
       onAgentDispose: (agent, release) => (agent.inactive ? undefined : (agent.dispose = release, () => { agent.unhooked = true })),
@@ -137,300 +138,313 @@ console.log('agent mounts:')
       toolSeen: (ws, server, tool) => { h.seen.push(`${ws}#${server}:${tool}`) },
       warn: message => { h.warnings.push(message) },
     }
-    h.mounts = new AgentMounts(h.host, { idleTimeoutMs: options.idleTimeoutMs ?? 60_000, mountWaitMs: options.mountWaitMs ?? 300 })
+    h.mounts = new AgentMounts(h.host, { idleTimeoutMs: options.idleTimeoutMs ?? 60000, mountWaitMs: options.mountWaitMs ?? 500 })
     return h
   }
   const agent = (id, cwd, preset = 'coder') => ({ id, cwd, preset, status: 'running' })
   const newActivity = (h, a) => { h.mounts.status(a, 'idle'); h.mounts.status(a, 'running') }
 
-  // AC5: per-workspace views; same name mounts in both
+  // The pool key includes the workspace even when the complete configs are identical.
   {
-    const h = harness({ config: { '/A': [srv('shared'), srv('onlyA')], '/B': [srv('shared', { command: 'y' }), srv('onlyB')] } })
-    const a = agent('a', '/A'), b = agent('b', '/B')
-    const changedA = await h.mounts.turn(a)
+    const h = harness({ config: { '/A': [srv('graphiti'), srv('onlyA')], '/B': [srv('graphiti'), srv('onlyB')] } })
+    const a = agent('a', '/A'), sub = agent('sub', '/A'), b = agent('b', '/B')
+    check('first turn reports fresh registrations', await h.mounts.turn(a))
+    await h.mounts.turn(sub)
     await h.mounts.turn(b)
-    check('AC5 agent A sees only workspace A servers', h.see(a).join() === 'onlyA,shared')
-    check('AC5 agent B sees only workspace B servers', h.see(b).join() === 'onlyB,shared')
-    check('AC5 same name mounted in both workspaces', h.started.includes('a:shared') && h.started.includes('b:shared'))
-    check('AC7 first turn reports a change so assembly re-runs', changedA === true)
-    check('AC7 a later turn with nothing new does not re-run', (await h.mounts.turn(a)) === false)
+    check('workspace A agents see only A servers', h.see(a).join() === 'graphiti,onlyA' && h.see(sub).join() === 'graphiti,onlyA')
+    check('workspace B sees only B servers', h.see(b).join() === 'graphiti,onlyB')
+    const ba = h.binding(a, 'graphiti'), bs = h.binding(sub, 'graphiti'), bb = h.binding(b, 'graphiti')
+    check('same workspace and ID reuse one backend by default', ba?.backend === bs?.backend && h.backends.length === 4)
+    check('same ID and identical config in another workspace remain separate', ba?.backend !== bb?.backend && h.backends.filter(x => x.name === 'graphiti').length === 2)
+    check('agentsIn and liveAgents retain per-workspace binding counts', h.mounts.agentsIn('/A').includes(a) && h.mounts.agentsIn('/A').includes(sub) && !h.mounts.agentsIn('/A').includes(b) && h.mounts.liveAgents('/A', 'graphiti') === 2 && h.mounts.liveAgents('/B', 'graphiti') === 1)
+    check('unchanged turn does not change registrations or start servers', !(await h.mounts.turn(a)) && h.backends.length === 4)
+    const request = deferred()
+    const first = ba.call(request.promise), second = bs.call()
+    check('shared request proxy reaches one stateful backend', await second === 1)
+    request.resolve()
+    check('concurrent proxy requests keep their own result and workspace state', await first === 2 && await bb.call() === 1)
+    await h.mounts.workspaceRemoved('/A')
+    check('removing one workspace never stops the same server ID in another', ba.backend.disposed && !bb.backend.disposed && h.see(a).length === 0 && h.see(b).join() === 'graphiti,onlyB')
     await h.mounts.dispose()
-    check('plugin unload disposes every agent mount', h.see(a).length === 0 && h.see(b).length === 0 && a.unhooked === true && h.scopes === 0)
+    check('unload removes every binding and backend exactly once', h.see(a).length === 0 && h.see(b).length === 0 && h.bindings.every(x => x.disposed && x.disposeCalls === 1) && h.backends.every(x => x.disposed && x.disposeCalls === 1))
   }
 
-  // AC6: nothing starts without a turn
+  // Explicit workspace scope shares; agent scope preserves isolated server state.
   {
-    const h = harness({ config: { '/A': [srv('s')] } })
-    const a = agent('a', '/A')
-    h.mounts.status(a, 'running')
-    h.mounts.status(a, 'idle')
-    check('AC6 status changes without a turn start nothing', h.started.length === 0 && h.scopes === 0)
-  }
-
-  // AC7: a hanging server does not block the turn beyond the cap
-  {
-    const h = harness({ config: { '/A': [srv('ok'), srv('down')] }, hang: ['down'], mountWaitMs: 150 })
-    const a = agent('a', '/A')
-    const started = Date.now()
-    const changed = await h.mounts.turn(a)
-    const elapsed = Date.now() - started
-    check('AC7 turn proceeds after the mount wait cap', elapsed >= 140 && elapsed < 1000, `elapsed ${elapsed}`)
-    check('AC7 healthy server mounted, hanging one excluded', changed && h.see(a).join() === 'ok')
-    const again = Date.now()
-    await h.mounts.turn(a)
-    check('AC7 a later step of the same activity does not wait again', Date.now() - again < 100)
+    const h = harness({ config: { '/A': [srv('shared', { scope: 'workspace' }), srv('private', { scope: 'agent' })] } })
+    const a = agent('a', '/A'), b = agent('b', '/A')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    const shared = h.binding(a, 'shared').backend
+    const privateA = h.binding(a, 'private').backend, privateB = h.binding(b, 'private').backend
+    check('explicit workspace scope shares, agent scope starts separate backends', shared === h.binding(b, 'shared').backend && privateA !== privateB && h.backends.length === 3)
+    check('agent-scoped request state is independent', await h.binding(a, 'private').call() === 1 && await h.binding(b, 'private').call() === 1)
+    await a.dispose()
+    check('agent disposal removes its bindings and only its private backend', h.see(a).length === 0 && privateA.disposed && !privateB.disposed && !shared.disposed && h.see(b).join() === 'private,shared')
+    await h.mounts.release(b)
+    check('last release retains shared backend but stops private backend', privateB.disposed && !shared.disposed && h.mounts.liveAgents('/A', 'shared') === 0 && !h.mounts.agentsIn('/A').includes(b))
+    const later = agent('later', '/A')
+    await h.mounts.turn(later)
+    check('later session reuses warm shared server without another startup', h.binding(later, 'shared').backend === shared && h.backends.filter(x => x.name === 'shared').length === 1)
     await h.mounts.dispose()
+    check('plugin unload cleans warm and private backends', h.live().length === 0)
   }
 
-  // AC7: a later step waits only for the activity's remaining budget, including a slow stop under the agent lock
-  {
-    const h = harness({ config: { '/A': [srv('ok')] }, disposeMs: { ok: 400 }, mountWaitMs: 200 })
-    const a = agent('a', '/A')
-    const t0 = Date.now()
-    await h.mounts.turn(a)
-    h.config['/A'] = [srv('ok', { command: 'changed' }), srv('slow')]
-    h.hang.add('slow')
-    await sleep(100)
-    const before = Date.now()
-    await h.mounts.turn(a)
-    const total = Date.now() - t0
-    check('AC7 second step stops waiting at the activity deadline', total < 260 && Date.now() - before < 160, `total ${total}`)
-    const third = Date.now()
-    await h.mounts.turn(a)
-    check('AC7 step after the deadline does not wait', Date.now() - third < 30)
-    h.open('slow')
-    await h.mounts.dispose()
-    check('stale mount is disposed before its remount', h.clashes === 0)
-  }
-
-  // AC8: abort ends the wait at once; the mount continues in the background
+  // Startup is gated before readiness: simultaneous agents must join one pending backend.
   {
     const h = harness({ config: { '/A': [srv('slow')] }, hang: ['slow'], mountWaitMs: 5000 })
+    const a = agent('a', '/A'), b = agent('b', '/A')
+    const controller = new AbortController()
+    const first = h.mounts.turn(a, controller.signal)
+    const duplicate = h.mounts.turn(a)
+    const second = h.mounts.turn(b)
+    let secondDone = false
+    void second.then(() => { secondDone = true })
+    await flush()
+    check('simultaneous agents and duplicate assemblies share one pending startup', h.backends.length === 1 && !secondDone && h.see(a).length === 0 && h.see(b).length === 0)
+    controller.abort()
+    await first
+    check('one aborted waiter does not dispose startup or finish another waiter', h.live().length === 1 && !secondDone)
+    h.open('slow')
+    await Promise.all([duplicate, second])
+    check('remaining waiters bind to the same completed server', h.see(a).join() === 'slow' && h.see(b).join() === 'slow' && h.binding(a, 'slow').backend === h.binding(b, 'slow').backend && h.backends.length === 1)
+    check('concurrent assemblies do not duplicate one agent binding', h.bindings.filter(x => x.agent === a && !x.disposed).length === 1)
+    check('discovery is attributed to the workspace once', h.seen.filter(x => x === '/A#slow:t1').length === 1)
+    await h.mounts.dispose()
+  }
+
+  // Only bounded-wait assertions need a real timer; all startup ordering uses explicit gates.
+  {
+    const h = harness({ config: { '/A': [srv('ok'), srv('slow')] }, hang: ['slow'], mountWaitMs: 60 })
+    const a = agent('a', '/A')
+    const start = Date.now()
+    const changed = await h.mounts.turn(a)
+    const elapsed = Date.now() - start
+    check('wait budget ends while a slow server remains pending', elapsed >= 40 && elapsed < 1500 && changed && h.see(a).join() === 'ok' && !h.backends.find(x => x.name === 'slow').connected, `elapsed ${elapsed}`)
+    const next = h.mounts.turn(a)
+    let immediate = false
+    void next.then(() => { immediate = true })
+    await flush()
+    check('later step in the same activity does not receive a fresh wait budget', immediate)
+    await next
+    newActivity(h, a)
+    let renewedDone = false
+    const renewed = h.mounts.turn(a).then(() => { renewedDone = true })
+    await flush()
+    check('status transition resets the next activity wait budget', !renewedDone && h.backends.length === 2)
+    h.open('slow')
+    await renewed
+    check('background startup eventually supplies tools without a restart', h.see(a).join() === 'ok,slow' && h.backends.length === 2)
+    await h.mounts.dispose()
+  }
+
+  // Pending readiness must not monopolize the agent's reconciliation queue.
+  {
+    const h = harness({ config: { '/A': [srv('healthy'), srv('pending')], '/B': [srv('other')] }, hang: ['pending'], mountWaitMs: 5000 })
     const a = agent('a', '/A')
     const controller = new AbortController()
-    setTimeout(() => controller.abort(), 50)
-    const started = Date.now()
-    await h.mounts.turn(a, controller.signal)
-    const elapsed = Date.now() - started
-    check('AC8 abort ends the mount wait at once', elapsed < 300, `elapsed ${elapsed}`)
-    const b = agent('b', '/A')
-    const pre = Date.now()
-    await h.mounts.turn(b, AbortSignal.abort())
-    check('AC8 already-aborted turn does not wait', Date.now() - pre < 50)
-    h.open('slow')
-    await sleep(30)
-    check('AC8 mount completes in the background', h.see(a).join() === 'slow' && h.mounts.liveAgents('/A', 'slow') === 2)
+    const waiting = h.mounts.turn(a, controller.signal)
+    await flush()
+    controller.abort()
+    await waiting
+    check('pending reconciliation prerequisite has a healthy binding and unresolved startup', h.see(a).join() === 'healthy' && !h.backends.find(x => x.name === 'pending').connected)
+    h.config['/A'] = [srv('healthy', { excludeTools: ['t1'] }), srv('pending'), srv('new')]
+    await h.mounts.configChanged('/A')
+    await h.mounts.turn(a, AbortSignal.abort())
+    await flush()
+    check('pending startup does not block filter edits or new server bindings', h.binding(a, 'healthy').exclude.has('t1') && h.see(a).includes('new'))
+    a.cwd = '/B'
+    await h.mounts.turn(a, AbortSignal.abort())
+    await flush()
+    check('workspace switch detaches old bindings before pending startup settles', h.see(a).join() === 'other' && h.mounts.liveAgents('/A', 'pending') === 0 && !h.backends.find(x => x.name === 'pending').connected)
+    h.open('pending')
+    await flush()
+    check('late readiness never restores the old workspace tools', h.see(a).join() === 'other')
     await h.mounts.dispose()
   }
 
-  // AC9: idle stop and remount
+  // Idle notifications no longer own backend lifetime.
   {
-    const IDLE = 61
-    const h = harness({ config: { '/A': [srv('s1'), srv('s2')] }, idleTimeoutMs: IDLE })
+    const h = harness({ config: { '/A': [srv('s')] }, idleTimeoutMs: 1 })
     const a = agent('a', '/A')
-    await h.mounts.turn(a)
-    const before = h.see(a).join()
-    a.status = 'idle'
     h.mounts.status(a, 'idle')
-    await sleep(150)
-    check('AC9 idle timeout stops the agent mounts', h.see(a).length === 0 && h.mounts.liveAgents('/A', 's1') === 0 && h.scopes === 0)
-    a.status = 'running'
-    h.mounts.status(a, 'running')
-    await h.mounts.turn(a)
-    check('AC9 next turn restores identical tools', h.see(a).join() === before)
-    const realSetTimeout = globalThis.setTimeout
-    let armed = 0
-    globalThis.setTimeout = (fn, ms, ...rest) => {
-      if (ms === IDLE) armed += 1
-      return realSetTimeout(fn, ms, ...rest)
-    }
-    try {
-      h.mounts.status(a, 'idle')
-      h.mounts.status(a, 'running')
-      await sleep(150)
-      check('AC9 running clears an armed idle timer', armed === 1 && h.see(a).join() === before)
-      h.mounts.status(a, 'idle')
-      await sleep(150)
-      check('AC9 armed timer firing while the agent runs does not stop', armed === 2 && h.see(a).join() === before)
-    } finally {
-      globalThis.setTimeout = realSetTimeout
-    }
-    await h.mounts.dispose()
-  }
-
-  // idle stop in progress when a turn starts
-  {
-    const h = harness({ config: { '/A': [srv('s')] }, idleTimeoutMs: 30, disposeMs: { s: 100 }, mountWaitMs: 1000 })
-    const a = agent('a', '/A')
+    check('status alone starts no server', h.backends.length === 0)
     await h.mounts.turn(a)
     a.status = 'idle'
     h.mounts.status(a, 'idle')
-    await sleep(50)
-    a.status = 'running'
-    h.mounts.status(a, 'running')
-    const changed = await h.mounts.turn(a)
-    check('turn during an idle stop waits for it, then remounts', changed && h.see(a).join() === 's' && h.started.filter(s => s === 'a:s').length === 2 && h.clashes === 0)
-    await h.mounts.dispose()
-  }
-
-  // AC10: subagent mounts its own set and releases it on dispose
-  {
-    const h = harness({ config: { '/A': [srv('s')] } })
-    const main = agent('main', '/A'), sub = agent('sub', '/A')
-    await h.mounts.turn(main)
-    check('AC10 subagent mounts nothing before its first turn', !h.started.includes('sub:s'))
-    await h.mounts.turn(sub)
-    check('AC10 subagent mounts its own instance', h.started.includes('sub:s') && h.mounts.liveAgents('/A', 's') === 2)
-    await sub.dispose()
-    check('AC10 subagent instance disposed with the subagent', h.disposed.includes('sub:s') && h.see(main).join() === 's')
-    await h.mounts.dispose()
-  }
-
-  // AC11: mcp.json edits
-  {
-    const h = harness({ config: { '/A': [srv('keep'), srv('gone')] } })
-    const a = agent('a', '/A'), b = agent('b', '/A')
-    await h.mounts.turn(a)
-    await h.mounts.turn(b)
-    h.config['/A'] = [srv('keep'), srv('added')]
-    await h.mounts.configChanged('/A')
-    check('AC11 removed server stops at once on all agents', h.disposed.includes('a:gone') && h.disposed.includes('b:gone'))
-    check('AC11 added server not started before the next turn', !h.started.some(s => s.endsWith(':added')))
-    newActivity(h, a)
-    await h.mounts.turn(a)
-    check('AC11 added server appears at the agent\'s next turn', h.see(a).join() === 'added,keep' && !h.started.includes('b:added'))
-    h.config['/A'] = [srv('keep', { enabled: false }), srv('added')]
-    await h.mounts.configChanged('/A')
-    check('AC11 disabled server stops at once', h.disposed.includes('a:keep') && h.disposed.includes('b:keep'))
-    h.config['/A'] = [srv('added', { command: 'changed' })]
-    newActivity(h, a)
-    await h.mounts.turn(a)
-    check('changed config remounts at the next turn', h.disposed.includes('a:added') && h.started.filter(s => s === 'a:added').length === 2 && h.clashes === 0)
+    await new Promise(resolve => setTimeout(resolve, 15))
+    check('legacy idle timeout is ignored and tool bindings stay warm', h.live().length === 1 && h.see(a).join() === 's')
+    await h.mounts.release(a)
+    check('releasing the last idle agent keeps the workspace backend', h.live().length === 1 && h.see(a).length === 0)
     await h.mounts.workspaceRemoved('/A')
-    check('workspace removal stops every agent', h.see(a).length === 0 && h.see(b).length === 0 && h.scopes === 0)
+    check('workspace removal cleans a backend with no agents', h.live().length === 0)
     await h.mounts.dispose()
   }
 
-  // excludeTools: passed to the mount; a changed list remounts at the next turn
+  // Config edits affect backends once, while tool filters are cheap per-agent updates.
   {
-    const h = harness({ config: { '/A': [srv('t', { excludeTools: ['x'] })] } })
-    const a = agent('a', '/A')
-    await h.mounts.turn(a)
-    check('mount receives the exclusion filter and reports seen tools', h.filters.get('a:t') === 'x' && h.seen.includes('/A#t:t1'))
-    h.config['/A'] = [srv('t', { excludeTools: ['x', 'y'] })]
+    const h = harness({ config: { '/A': [srv('keep'), srv('gone'), srv('filtered', { excludeTools: ['t1'] })] } })
+    const a = agent('a', '/A'), b = agent('b', '/A')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    const old = h.binding(a, 'filtered').backend
+    const count = h.backends.length
+    check('initial binding receives exclusions and server discovery is reported', h.binding(a, 'filtered').exclude.has('t1') && h.seen.includes('/A#filtered:t1'))
+    h.config['/A'] = [srv('keep'), srv('gone'), srv('filtered', { excludeTools: ['t1', 't2'] })]
+    await h.mounts.configChanged('/A')
+    check('filter config notification does not restart the server or eagerly update bindings', !old.disposed && h.backends.length === count && !h.binding(a, 'filtered').exclude.has('t2'))
+    newActivity(h, a)
+    check('filter change reports a registration generation change', await h.mounts.turn(a))
+    check('filter updates only the current agent binding without restarting', h.binding(a, 'filtered').exclude.has('t2') && !h.binding(b, 'filtered').exclude.has('t2') && h.backends.length === count && h.binding(a, 'filtered').backend === old)
+    newActivity(h, b)
+    await h.mounts.turn(b)
+    check('other agent updates its filter on its next turn', h.binding(b, 'filtered').exclude.has('t2') && h.backends.length === count)
+    const updates = h.binding(a, 'filtered').updates
+    check('unchanged filter does not change generation', !(await h.mounts.turn(a)) && h.binding(a, 'filtered').updates === updates)
+    h.config['/A'] = [srv('keep', { enabled: false }), srv('filtered', { excludeTools: ['t1', 't2'] }), srv('added')]
+    await h.mounts.configChanged('/A')
+    check('removed and disabled servers stop on all agents immediately', h.backends.filter(x => ['keep', 'gone'].includes(x.name)).every(x => x.disposed) && h.see(a).join() === 'filtered' && h.see(b).join() === 'filtered')
+    check('added backend waits until a turn', !h.backends.some(x => x.name === 'added'))
     newActivity(h, a)
     await h.mounts.turn(a)
-    check('changed excludeTools remounts at the next turn', h.started.filter(s => s === 'a:t').length === 2 && h.filters.get('a:t') === 'x,y' && h.clashes === 0)
+    check('added backend binds only the agent taking a turn', h.see(a).join() === 'added,filtered' && h.see(b).join() === 'filtered')
+    h.config['/A'] = [srv('filtered', { command: 'changed', excludeTools: ['t1', 't2'] }), srv('added')]
+    await h.mounts.configChanged('/A')
     newActivity(h, a)
     await h.mounts.turn(a)
-    check('unchanged excludeTools does not remount', h.started.filter(s => s === 'a:t').length === 2)
+    check('transport config change replaces backend once at the next turn', old.disposed && h.binding(a, 'filtered').backend !== old && h.backends.filter(x => x.name === 'filtered').length === 2)
+    newActivity(h, b)
+    await h.mounts.turn(b)
+    check('second agent joins replacement without another restart', h.binding(b, 'filtered').backend === h.binding(a, 'filtered').backend && h.backends.filter(x => x.name === 'filtered').length === 2)
+    await h.mounts.workspaceRemoved('/A')
+    check('workspace removal clears all bindings and pooled servers', h.live().length === 0 && h.see(a).length === 0 && h.see(b).length === 0)
     await h.mounts.dispose()
   }
 
-  // AC12 / AC13: unmatched cwd mounts nothing; re-checked at the next turn
+  // Replacements share the old transport's shutdown barrier, including scope changes.
   {
-    const h = harness({ config: { '/A': [srv('s')] } })
-    const stray = agent('x', '/elsewhere')
-    const changed = await h.mounts.turn(stray)
-    check('AC12 unmatched cwd mounts nothing without error', !changed && h.started.length === 0 && h.warnings.length === 0 && h.scopes === 0)
-    h.config['/elsewhere'] = [srv('late')]
-    newActivity(h, stray)
-    await h.mounts.turn(stray)
-    check('AC13 workspace that becomes available is picked up at the next turn', h.see(stray).join() === 'late')
+    const h = harness({ config: { '/A': [srv('replace')] } })
+    const a = agent('a', '/A'), b = agent('b', '/A')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    const old = h.binding(a, 'replace').backend
+    old.disposeGate = deferred()
+    h.config['/A'] = [srv('replace', { command: 'changed' })]
+    const changed = h.mounts.configChanged('/A')
+    const first = h.mounts.turn(a), second = h.mounts.turn(b)
+    await flush()
+    check('concurrent replacement waits for one old transport shutdown', h.backends.length === 1 && old.disposeCalls === 1 && !old.disposed)
+    old.disposeGate.resolve()
+    await Promise.all([changed, first, second])
+    check('concurrent replacement starts exactly one successor after shutdown', old.disposed && h.backends.length === 2 && h.binding(a, 'replace').backend === h.binding(b, 'replace').backend)
+    h.config['/A'] = [srv('replace', { command: 'changed', scope: 'agent' })]
+    await h.mounts.configChanged('/A')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    check('workspace-to-agent scope change creates two private successors', h.live().length === 2 && h.binding(a, 'replace').backend !== h.binding(b, 'replace').backend)
+    h.config['/A'] = [srv('replace', { command: 'changed' })]
+    await h.mounts.configChanged('/A')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    check('agent-to-workspace scope change retires private backends and shares again', h.live().length === 1 && h.binding(a, 'replace').backend === h.binding(b, 'replace').backend)
     await h.mounts.dispose()
   }
 
-  // AC14: every agent of a workspace gets the same servers regardless of preset
+  // A disposed agent must not cancel shared startup or acquire a late binding.
   {
-    const h = harness({ config: { '/A': [srv('S'), srv('T')] } })
-    const orchestrator = agent('p', '/A', 'orchestrator'), coder = agent('q', '/A', 'coder')
-    await h.mounts.turn(orchestrator)
-    await h.mounts.turn(coder)
-    check('AC14 agents of different presets get identical servers', h.see(orchestrator).join() === 'S,T' && h.see(coder).join() === 'S,T')
-    await h.mounts.dispose()
-  }
-
-  // AC15: profile-level name conflict
-  {
-    const h = harness({ config: { '/A': [srv('deepwiki'), srv('local')] }, reserved: ['deepwiki'] })
-    const a = agent('a', '/A')
-    await h.mounts.turn(a)
-    check('AC15 conflicting server never mounted', !h.started.includes('a:deepwiki') && h.see(a).join() === 'local')
-    const only = harness({ config: { '/A': [srv('deepwiki')] }, reserved: ['deepwiki'] })
-    await only.mounts.turn(agent('b', '/A'))
-    check('no scope opened when there are no candidates', only.started.length === 0 && only.scopes === 0)
-    await h.mounts.dispose()
-  }
-
-  // concurrent assemblies share one in-flight mount
-  {
-    const h = harness({ config: { '/A': [srv('g')] }, hang: ['g'], mountWaitMs: 2000 })
-    const a = agent('a', '/A')
-    const first = h.mounts.turn(a)
-    const second = h.mounts.turn(a)
-    await sleep(20)
-    h.open('g')
-    const [c1, c2] = await Promise.all([first, second])
-    check('concurrent assemblies share one in-flight mount', h.started.length === 1 && c1 && c2 && h.see(a).join() === 'g')
-    await h.mounts.dispose()
-  }
-
-  // agent dispose / plugin unload during an in-flight mount
-  {
-    const h = harness({ config: { '/A': [srv('g')] }, hang: ['g'], mountWaitMs: 50 })
-    const a = agent('a', '/A')
-    await h.mounts.turn(a)
+    const h = harness({ config: { '/A': [srv('pending')] }, hang: ['pending'], mountWaitMs: 5000 })
+    const a = agent('a', '/A'), b = agent('b', '/A')
+    const controller = new AbortController()
+    const turn = h.mounts.turn(a, controller.signal)
+    await flush()
+    controller.abort()
+    await turn
     await a.dispose()
-    h.open('g')
-    await sleep(20)
-    check('agent dispose during an in-flight mount disposes it', h.disposed.includes('a:g') && h.see(a).length === 0 && h.mounts.liveAgents('/A', 'g') === 0 && h.scopes === 0)
-    const u = harness({ config: { '/A': [srv('g')] }, hang: ['g'], mountWaitMs: 50 })
-    const b = agent('b', '/A')
-    await u.mounts.turn(b)
-    await u.mounts.dispose()
-    u.open('g')
-    await sleep(20)
-    check('plugin unload during an in-flight mount disposes it', u.disposed.includes('b:g') && u.see(b).length === 0 && u.scopes === 0)
-    check('turns after unload mount nothing', (await u.mounts.turn(agent('c', '/A'))) === false && u.started.length === 1)
+    check('agent release during startup retains shared backend', h.backends.length === 1 && !h.backends[0].disposed && h.mounts.liveAgents('/A', 'pending') === 0)
+    const joined = h.mounts.turn(b)
+    await flush()
+    h.open('pending')
+    await joined
+    check('late startup binds a later agent, never resurrects disposed agent', h.see(a).length === 0 && h.see(b).join() === 'pending' && h.backends.length === 1)
+    await h.mounts.release(b)
+    await h.mounts.dispose()
+    check('unload cleans shared backend after every agent was released', h.live().length === 0)
+    check('turn after unload starts nothing', !(await h.mounts.turn(agent('c', '/A'))) && h.backends.length === 1)
+  }
+  {
+    const h = harness({ config: { '/A': [srv('pending')] }, hang: ['pending'], mountWaitMs: 5000 })
+    const a = agent('a', '/A')
+    const controller = new AbortController()
+    const turn = h.mounts.turn(a, controller.signal)
+    await flush()
+    controller.abort()
+    await turn
+    await h.mounts.dispose()
+    h.open('pending')
+    await flush()
+    check('unload during startup prevents late registrations and closes backend', h.backends.length === 1 && h.backends[0].disposed && h.see(a).length === 0)
   }
 
-  // failed startup: recorded, dropped without a registration change, retried at the next turn, warned once
+  // Failed startup has one error per workspace/server, and a later turn retries.
   {
-    const h = harness({ config: { '/A': [srv('bad')] }, fail: { bad: 'spawn ENOENT' }, mountWaitMs: 1000 })
+    const h = harness({ config: { '/A': [srv('bad')] }, fail: { bad: 'spawn ENOENT' } })
     const a = agent('a', '/A')
-    const changed = await h.mounts.turn(a)
-    check('failed mount records lastError, no change reported', !changed && h.mounts.lastError('/A', 'bad') === 'spawn ENOENT' && h.see(a).length === 0)
-    await sleep(20)
-    check('failed mount: entry dropped, empty agent scope disposed', h.mounts.liveAgents('/A', 'bad') === 0 && h.scopes === 0 && h.disposed.includes('a:bad'))
+    await h.mounts.turn(a)
+    await flush()
+    check('startup failure records its cause and leaves no visible tools', h.mounts.lastError('/A', 'bad') === 'spawn ENOENT' && h.see(a).length === 0 && h.mounts.liveAgents('/A', 'bad') === 0)
+    check('failed startup backend is disposed', h.backends.length === 1 && h.backends[0].disposed)
     newActivity(h, a)
-    const again = await h.mounts.turn(a)
-    check('failed mount: remounted at the next turn, still no change', !again && h.started.length === 2 && h.clashes === 0)
-    check('failed mount: same error warned once', h.warnings.filter(w => w.includes('spawn ENOENT')).length === 1, h.warnings.join(' | '))
+    await h.mounts.turn(a)
+    await flush()
+    check('later turn retries failed startup without leaking its predecessor', h.backends.length === 2 && h.backends.every(x => x.disposed))
     h.fail.delete('bad')
     newActivity(h, a)
-    check('successful remount reports a change', await h.mounts.turn(a))
-    check('successful remount clears lastError', h.see(a).join() === 'bad' && h.mounts.lastError('/A', 'bad') === undefined)
+    check('successful retry reports fresh registrations', await h.mounts.turn(a))
+    check('successful retry clears error and mounts usable tools', h.mounts.lastError('/A', 'bad') === undefined && h.see(a).join() === 'bad' && h.backends.length === 3)
     await h.mounts.dispose()
   }
-
-  // stale errors cleared on server or workspace removal
   {
     const h = harness({ config: { '/A': [srv('bad'), srv('worse')] }, fail: { bad: 'boom', worse: 'bang' } })
     const a = agent('a', '/A')
     await h.mounts.turn(a)
     h.config['/A'] = [srv('worse')]
     await h.mounts.configChanged('/A')
-    check('removed server drops its lastError', h.mounts.lastError('/A', 'bad') === undefined && h.mounts.lastError('/A', 'worse') === 'bang')
+    check('removed server clears only its own lastError', h.mounts.lastError('/A', 'bad') === undefined && h.mounts.lastError('/A', 'worse') === 'bang')
     await h.mounts.workspaceRemoved('/A')
-    check('removed workspace drops its lastErrors', h.mounts.lastError('/A', 'worse') === undefined)
+    check('removed workspace clears remaining lastErrors', h.mounts.lastError('/A', 'worse') === undefined)
     await h.mounts.dispose()
   }
 
-  // inactive agent: nothing mounted
+  // Workspace lookup is retried and bindings move without destroying warm backends.
   {
-    const h = harness({ config: { '/A': [srv('s')] } })
-    const dead = { ...agent('d', '/A'), inactive: true }
-    check('inactive agent is never mounted', (await h.mounts.turn(dead)) === false && h.started.length === 0)
+    const h = harness({ config: { '/A': [srv('s')], '/B': [srv('t')] } })
+    const a = agent('a', '/elsewhere')
+    check('unmatched workspace has no backend or warning', !(await h.mounts.turn(a)) && h.backends.length === 0 && h.warnings.length === 0)
+    h.config['/elsewhere'] = [srv('late')]
+    newActivity(h, a)
+    await h.mounts.turn(a)
+    check('newly available workspace is picked up at the next turn', h.see(a).join() === 'late')
+    const late = h.binding(a, 'late').backend
+    a.cwd = '/B'
+    newActivity(h, a)
+    await h.mounts.turn(a)
+    check('workspace change removes stale binding but retains old warm backend', h.see(a).join() === 't' && !late.disposed && h.mounts.liveAgents('/elsewhere', 'late') === 0 && h.mounts.agentsIn('/B').includes(a))
+    await h.mounts.dispose()
+  }
+  {
+    const h = harness({ config: { '/A': [srv('S'), srv('T')] } })
+    const a = agent('a', '/A', 'orchestrator'), b = agent('b', '/A', 'coder')
+    await Promise.all([h.mounts.turn(a), h.mounts.turn(b)])
+    check('different presets share the same workspace backends and tools', h.see(a).join() === 'S,T' && h.see(b).join() === 'S,T' && h.backends.length === 2)
+    await h.mounts.dispose()
+  }
+  {
+    const h = harness({ config: { '/A': [srv('deepwiki'), srv('local')] }, reserved: ['deepwiki'] })
+    await h.mounts.turn(agent('a', '/A'))
+    check('host candidate filtering keeps profile conflicts out of the pool', h.backends.length === 1 && h.backends[0].name === 'local')
+    await h.mounts.dispose()
+    const only = harness({ config: { '/A': [srv('deepwiki')] }, reserved: ['deepwiki'] })
+    await only.mounts.turn(agent('b', '/A'))
+    check('no candidate starts no backend', only.backends.length === 0)
+    await only.mounts.dispose()
+    const dead = harness({ config: { '/A': [srv('s')] } })
+    check('inactive agent never starts a backend', !(await dead.mounts.turn({ ...agent('d', '/A'), inactive: true })) && dead.backends.length === 0)
+    await dead.mounts.dispose()
   }
 }
 
@@ -474,9 +488,13 @@ console.log('workspace resolution:')
     const lateMounts = new AgentMounts({
       workspaceOf: a => agentWorkspace(late, a.cwd),
       candidates: () => [{ name: 's', enabled: true, excludeTools: [], config: { transport: 'stdio', serverName: 's', command: 'x', args: [], env: {}, cwd: ws, toolCallTimeoutMs: 60000, failOnStartupError: true } }],
-      openScope: () => {
+      openServer: () => {
         opened += 1
-        return { mount: () => ({ ready: Promise.resolve(), dispose: async () => {} }), dispose: async () => {} }
+        return {
+          ready: Promise.resolve(),
+          bind: () => ({ update: () => {}, dispose: async () => {} }),
+          dispose: async () => {},
+        }
       },
       onAgentDispose: () => () => {},
       isIdle: () => false,

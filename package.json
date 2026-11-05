@@ -11,6 +11,7 @@
     "build:client": "pnpm exec tsc -p packages/dsh-mcp-mgr-ui && pnpm exec tsdown --config-loader tsx --config packages/dsh-mcp-mgr-ui/tsdown.config.ts --env.DSH_BUILD_FACE client",
     "build": "pnpm run build:host && pnpm run build:client",
     "verify": "node verify.mjs",
+    "test:e2e": "node e2e/e2e.mjs && node e2e/apply-remove-settle.mjs && node e2e/pool-edge-cases.mjs",
     "check": "pnpm run build && pnpm run verify",
     "profile:add": "node scripts/profile.mjs add",
     "profile:remove": "node scripts/profile.mjs remove"

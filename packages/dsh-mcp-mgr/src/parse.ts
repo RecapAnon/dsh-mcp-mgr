@@ -15,6 +15,8 @@ export interface ParsedServer {
   readonly name: string
   /** Whether the entry is enabled (`enabled: false` disables; absent/other = enabled). */
   readonly enabled: boolean
+  /** Workspace sharing is the default; agent scope opts out for stateful servers. */
+  readonly scope?: 'workspace' | 'agent'
   readonly config: McpClientConfig
   /** Tool names (public name without `mcp__<name>__`) never registered for this server. */
   readonly excludeTools: readonly string[]
@@ -101,6 +103,11 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       continue
     }
     const enabled = rawEntry.enabled !== false
+    const scope = rawEntry.scope === undefined ? 'workspace' : rawEntry.scope
+    if (scope !== 'workspace' && scope !== 'agent') {
+      errors.push({ name, message: '"scope" must be either "workspace" or "agent"' })
+      continue
+    }
     // Missing type is the documented HTTP shorthand; reject unknown types
     // instead of silently treating a typo as stdio.
     const rawType = rawEntry.type
@@ -149,6 +156,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       servers.push({
         name,
         enabled,
+        scope,
         excludeTools,
         config: {
           transport: 'stdio',
@@ -178,6 +186,7 @@ export function parseMcpJson(text: string, workspacePath: string): ParseResult {
       servers.push({
         name,
         enabled,
+        scope,
         excludeTools,
         config: {
           transport: 'streamable-http',

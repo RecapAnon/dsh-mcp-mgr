@@ -2,19 +2,17 @@
  * dsh-mcp-mgr: workspace-level MCP manager for DeepSeek Harness.
  *
  * Discovers `.dsh/dshmm/mcp.json` under every registered workspace (or the
- * process cwd in headless) and mounts its servers lazily per agent: at an
- * agent's turn assembly, the enabled servers of its session's workspace run
- * in an agent-keyed scope. A Typert Remote (`mcpMgr`) serves state and
+ * process cwd in headless) and pools backends by workspace and server ID.
+ * Session creation starts the backend; each agent gets scoped bindings.
+ * A Typert Remote (`mcpMgr`) serves state and
  * write-back to the web UI.
  * @module dsh-mcp-mgr
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
-// The mcp-client plugin object; mounted once per agent and server.
-import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import type { Config as McpClientConfig } from '@deepseek-ai/dsh-mcp-client'
-import { createScope } from '@deepseek-ai/dsh-scope'
+import { openSharedServer } from './backend.ts'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -22,7 +20,7 @@ import { fileURLToPath } from 'node:url'
 import { basename, dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import { agentWorkspace, collectWorkspaces, hasManagerFile, nativeRealpath } from './discovery.ts'
-import { AgentMounts, type AgentScopeHandle, type ToolFilter } from './mounts.ts'
+import { AgentMounts } from './mounts.ts'
 import { draftToEntry, mcpJsonPath, parseMcpJson, parseToolList, SERVER_NAME_PATTERN, validateDraft, type ParsedServer, type ParseResult } from './parse.ts'
 import { parseProfileTools, ProfileRestrictions, profileToolsPath, toolKey } from './restrict.ts'
 import { changeOutcome, isMcpClientEntry, profileServerNames, scanProfileEntries, type LoaderEntryView, type PluginChangeView } from './profile.ts'
@@ -33,7 +31,7 @@ import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServe
 export type * from './types.ts'
 export { parseMcpJson, mcpJsonPath, expandEnv } from './parse.ts'
 export { AgentMounts } from './mounts.ts'
-export type { AgentScopeHandle, MountHandle, MountsHost, MountsOptions, ToolFilter } from './mounts.ts'
+export type { AgentBindingHandle, AgentScopeHandle, MountHandle, MountsHost, MountsOptions, SharedMountHandle, ToolFilter } from './mounts.ts'
 export { ProfileRestrictions, parseProfileTools } from './restrict.ts'
 export type { RestrictHost } from './restrict.ts'
 
@@ -52,7 +50,7 @@ export interface Config {
   enabled: boolean
   /** Periodic rescan interval covering workspaces added at runtime. */
   rescanIntervalMs: number
-  /** An agent's mounts stop after this long without a turn. */
+  /** Deprecated and ignored; retained for existing profile configurations. */
   agentIdleTimeoutMs: number
   /** Total mount wait budget of one agent activity (turn). */
   agentMountWaitMs: number
@@ -89,6 +87,7 @@ interface HostEvents {
     options: { prepend: boolean },
   ): () => boolean
   on(name: 'agent/status', listener: (payload: { agent: object; status: string }) => void): () => boolean
+  on(name: 'agent/created', listener: (payload: { agent: object; signal?: AbortSignal }) => Promise<void>): () => boolean
 }
 
 interface ToolsView {
@@ -100,7 +99,7 @@ interface ToolsView {
 const EMPTY_PARSE: ParseResult = { servers: [], errors: [] }
 
 /**
- * The manager service: owns discovery, per-agent mounts, and the Remote
+ * The manager service: owns discovery, pooled backends, agent bindings, and the Remote
  * surface. `workspaceRegistry` is deliberately NOT injected — it is a web-only
  * service that appears asynchronously; discovery re-probes on every rescan.
  */
@@ -135,7 +134,7 @@ export class McpMgrGateway extends TypertRemoteService {
     this.mounts = new AgentMounts({
       workspaceOf: agent => agentWorkspace(ctx, (agent as AgentView).session?.header?.cwd, this.workspaceSet),
       candidates: workspace => this.candidates(workspace),
-      openScope: agent => openAgentScope(ctx, agent),
+      openServer: (server, seen) => openSharedServer(ctx, viaStdioShim(server), seen),
       onAgentDispose: (agent, release) => {
         try {
           return (agent as AgentView).ctx.effect(() => release, 'mcp-mgr: agent mounts')
@@ -196,6 +195,11 @@ export class McpMgrGateway extends TypertRemoteService {
       }
       return next()
     }, { prepend: true })
+    events.on('agent/created', async ({ agent, signal }) => {
+      await this.runRescan()
+      await this.mounts.turn(agent, signal)
+      this.mounts.status(agent, 'created')
+    })
     events.on('agent/status', ({ agent, status }) => { this.mounts.status(agent, status) })
     this.rescanTimer = setInterval(() => {
       void this.runRescan()
@@ -533,8 +537,8 @@ export class McpMgrGateway extends TypertRemoteService {
         void this.runRescan()
       })
       for (const path of next) this.workspaceSet.add(path)
-      // Removed, disabled or newly conflicting servers stop now on every
-      // agent; added or changed ones are picked up at each agent's next turn.
+      // Retire removed, disabled, conflicting or reconfigured backends once.
+      // New backends and tool-filter edits bind on creation or the next turn.
       for (const path of [...next].sort()) await this.mounts.configChanged(path)
       const conflicts = new Set(this.workspaceRows().filter(row => row.status === 'conflict').map(row => row.name))
       this.profileServers = await scanProfileEntries(this.loaderEntries(), conflicts)
@@ -718,29 +722,6 @@ function toolNames(tools: ToolsView, agent: object): string[] {
   }
 }
 
-/** An agent-keyed scope under the plugin context; disposed with the agent or the plugin. */
-function openAgentScope(ctx: Context, agent: object): AgentScopeHandle {
-  const scope = createScope(ctx, agent)
-  return {
-    mount: (config, filter) => {
-      const plugin = {
-        name: mcpClient.name,
-        inject: mcpClient.inject,
-        apply: async (pluginCtx: Context, resolved: typeof config) => mcpClient.apply(withToolFilter(pluginCtx, resolved.serverName, filter), resolved),
-      }
-      const fiber = scope.ctx.plugin(plugin, viaStdioShim(config)) as unknown as FiberView
-      return {
-        ready: fiber.await().then(() => undefined),
-        dispose: async () => {
-          await fiber.dispose()
-          while (fiber.inertia !== undefined) await fiber.inertia
-        },
-      }
-    },
-    dispose: () => scope.dispose(),
-  }
-}
-
 /** The stdio shim and the cross-spawn of mcp-client's SDK, when both resolve. */
 const STDIO_SHIM = resolveStdioShim()
 
@@ -758,33 +739,6 @@ function resolveStdioShim(): { script: string; spawnModule: string } | undefined
 function viaStdioShim(config: McpClientConfig): McpClientConfig {
   if (config.transport !== 'stdio' || STDIO_SHIM === undefined) return config
   return { ...config, command: process.execPath, args: [STDIO_SHIM.script, STDIO_SHIM.spawnModule, config.command, ...config.args] }
-}
-
-/**
- * The mcp-client's context with `tools.register` filtered: excluded tools are
- * never registered, so they never reach the agent's prompt. Everything else
- * reads through to the real context with the original receiver.
- */
-function withToolFilter(ctx: Context, serverName: string, filter: ToolFilter): Context {
-  const tools = {
-    register: (definition: { name: string }): (() => void) => {
-      const tool = toolKey(serverName, definition.name)
-      if (tool !== undefined) {
-        filter.seen(tool)
-        if (filter.exclude.has(tool)) return () => {}
-      }
-      return (ctx as unknown as { tools: ToolsView }).tools.register(definition)
-    },
-  }
-  return new Proxy(ctx, {
-    get: (target, key, receiver) => key === 'tools' ? tools : Reflect.get(target, key, receiver),
-  })
-}
-
-interface FiberView {
-  await(): Promise<unknown>
-  dispose(): unknown
-  readonly inertia?: Promise<unknown>
 }
 
 /**
