@@ -1,6 +1,6 @@
 # dsh-mcp-mgr 需求文档
 
-> 状态：**组 1 + 组 2 已实现并通过本地验证**（spike 结论已落地）
+> 状态：**工作区后端池重构已实现并通过本地回归**；当前 DSH host 尚未重启验证。旧实现记录保留为历史。
 
 ## 背景
 
@@ -11,7 +11,7 @@ dsh 目前的 MCP 接入只有一条路径：`@deepseek-ai/dsh-mcp-client` 插�
 - **插件组 1（核心，host 插件）**：工作区目录下 `.dsh/dshmm/mcp.json`（类 Claude/Codex 的 `mcpServers` 格式），dsh 载入工作区时自动发现并动态注册其中所有 MCP server；文件变更热同步；工作区删除时卸载。
 - **插件组 2（web UI 插件，仅 web profile）**：在 dsh 设置页中展示与管理由组 1 注册的 MCP：列表、状态、增删改、来源工作区标注、冲突提示。
 
-## 实现状态（2026-08-15）
+## 历史实现状态（2026-08-15，非池化验证）
 
 ```
 packages/dsh-mcp-mgr/      组1 host 插件（已实现 + 验证）
@@ -32,35 +32,46 @@ gen.mjs / verify.mjs / e2e/   生成 + 单测 + 真实 MCP server 端到端
 
 ## 总体设计
 
-> 2026-10-07 起以 [ADR-0001](<adr/0001-agent-scoped-lazy-workspace-mcp-mounts.md>) 为准（accepted，2026-10-08 修订：去掉 M1/E2，已按修订实现）：按 agent 懒挂载、空闲停止、移除严格模式。
+> 已批准的池化契约取代 [ADR-0001](<adr/0001-agent-scoped-lazy-workspace-mcp-mounts.md>) 中每 agent 独立后端、首轮懒启动与空闲停止的规则；ADR 保留为历史。agent 作用域可见性与工作区边界不变。
 
 ```
-mcp.json (每个工作区 .dsh/dshmm/)
-    │ 发现（启动全量 + watch + 周期重扫）→ 仅解析/缓存，不挂载
+mcp.json → 发现、解析、watch / 周期重扫
     ▼
-mcp-mgr host 插件 (组1)
-    │ agent 首个 turn（system-prompt/assemble）按 session cwd 解析所属工作区
-    │ 挂载全部启用且非 conflict 的 server（无 preset 逻辑）；单次活动（running → idle）挂载等待共用 agentMountWaitMs（默认 30 秒），turn 中止即停止等待
-    ├─ createScope(pluginCtx, agent) + ctx.plugin(mcp-client, config)  每 agent × server 一个实例
-    │ 空闲 agentIdleTimeoutMs（默认 15 分钟）停止，下个 turn 重挂
+agent/created（创建 / 恢复）；首个 turn 兜底
     ▼
-agent 自有 scope 的 tools/resources/instructions  ← 仅该 agent 可见
-
-组2 web UI: 展示各工作区配置状态 + 活跃/已连接 agent 数
+后端池：工作区规范路径 + server ID → 一个后端、一个启动 promise
+    │ scope: 'agent' → 改为每 agent 独立后端
+    ▼
+每 agent 的 tools / resources / server instructions 绑定
 ```
+
+共享后端跨 idle 和最后一个 agent 销毁保持运行；隔离后端随所属 agent 销毁。会话启动等待受 `agentMountWaitMs` 限制，abort 只结束等待，不取消共享启动。首次冷启动仍存在，共享 server 的可变状态也会共享。
 
 ## 关键决策（已定）
 
 | 决策 | 结论 |
 |---|---|
-| 工作区语义 | **按 agent 隔离**（ADR-0001，取代原"并集"）：agent 只挂载其 session `cwd`（realpath 精确等于已登记工作区）所属工作区的 mcp.json；无匹配则不挂载；无 registry（headless）时仅 `realpath.native(cwd)` 等于 `realpath.native(process.cwd())` 的 agent 获得该工作区 server；web profile 的 registry 尚未就绪时视为无工作区 |
-| 挂载时机 | 懒挂载：首个 turn 挂载，单次活动（running → idle）所有挂载等待（含重新组装）共用 30 秒上限（`agentMountWaitMs`，可配）并响应 turn 中止信号，空闲 15 分钟（`agentIdleTimeoutMs`，可配）停止；子 agent 同规则独立挂载 |
+| 工作区语义 | **后端默认按工作区共享，可见性按 agent 隔离**：agent 仅绑定 session `cwd` realpath 精确匹配的登记工作区；无匹配则不绑定。headless 仅匹配 host cwd；Web registry 未就绪时等待后续 turn 兜底 |
+| 后端身份 | 单个 host 内以 **工作区规范路径 + server ID** 唯一；不同工作区可使用同名 `graphiti`，保留各自配置/记忆命名空间，无需全局改名 |
+| 隔离选项 | mcp.json `scope: 'workspace'`（缺省）共享；`scope: 'agent'` 每 agent 独立后端；两者工具/resources/server instructions 均按 agent 注册 |
+| 启动与等待 | `agent/created` 在会话创建/恢复时启动，首个 turn 兜底；同一池项并发加入共用启动 promise。会话启动及首轮兜底等待受 `agentMountWaitMs` 限制；超时/abort 结束等待而不取消共享启动 |
+| 生命周期 | 共享后端跨 idle / 最后 agent 销毁保持运行；server 禁用/移除、传输配置变更、工作区移除、管理器卸载或 host 关闭时停止。scope 变更替换后端；agent 隔离后端随所属 agent 销毁，无 idle 重启 |
+| 配置兼容 | `agentIdleTimeoutMs` 保留但已弃用且忽略；`excludeTools` 仅更新绑定，不重启后端 |
 | 严格模式 | **移除**（含 `activeWorkspace`、UI 开关与 localStorage 回放） |
 | 按 preset 屏蔽 | **零耦合**：本插件不含 preset 逻辑、不发事件，同一工作区所有 agent 获得相同 server；preset 级屏蔽由独立插件在调用时处理（E1）。被屏蔽 preset（如 orchestrator）仍可见工作区 MCP 工具且进程会启动。见 ADR-0001 |
 | 同名冲突 | 工作区 server 与 profile 级 server 同名：标 conflict，不挂载，UI 展示 |
 | 通道路线 | **通道①（自建 Typert Remote）可行**（S1 已验证，代价：vendor protocol 源码 + workspace 布局）；② settings 通道仍可作轻量备选 |
 | 格式映射 | `mcpServers` → mcp-client config 直译；支持 `${VAR}` env 展开；Claude `type: http` → `transport: streamable-http` |
 | stdio server cwd | **必须显式传工作区根路径**（`cwd:''` 会落到 host 进程目录，S3） |
+
+## 池化验收条件（本地回归覆盖）
+
+- **AC1 身份与复用**：同一规范工作区 + server ID 的多个 agent/子 agent（含并发创建）仅启动一个共享后端；不同工作区同名 server 独立，无配置重命名。
+- **AC2 启动与就绪**：创建/恢复触发启动，已有 agent / 延迟发现通过首轮兜底；等待有界，任一等待者超时/abort 不取消共享启动、不影响其他等待者，后台就绪后可在后续组装使用。
+- **AC3 生命周期**：idle 与最后一个 agent 销毁不停止共享后端；server 禁用/移除、传输配置变更、工作区移除及管理器/host 退出会清理后端和绑定，替换不产生重叠进程。
+- **AC4 可选隔离**：`scope: 'agent'` 启动独立后端，随所属 agent 销毁且不因 idle 重启；scope 变更替换相应后端；`agentIdleTimeoutMs` 不改变上述行为。
+- **AC5 绑定与隔离**：工具、resources、server instructions 只对所属工作区的已绑定 agent 可见；`excludeTools` 更新绑定且进程不重启；共享状态风险与首次冷启动限制在用户文档中说明。
+- **AC6 故障与并发**：验证启动失败/重试、重连、配置替换、调用中 agent 销毁与并发调用；不得将共享连接等同于 server 状态可安全并发使用。
 
 ## 机制限制（dsh 现状约束）
 
@@ -110,14 +121,14 @@ agent 自有 scope 的 tools/resources/instructions  ← 仅该 agent 可见
 - 清理本地 profile 执行 `pnpm run profile:remove`。
 - `DSH_HARNESS_ROOT` 仅供 `profile:add` / `profile:remove` 调用 source CLI；`build`、`gen.mjs`、`verify.mjs` 不读取它。
 
-已验证的本地回归标记为 `ALL PASS`、`E2E PASS`、`SETTLE PASS`；真实 Web UI 渲染仍需人工确认。
+本次验证：`pnpm run check`、`pnpm run test:e2e`，以及各套件连续五轮回归（`ALL PASS`、`E2E PASS`、`SETTLE PASS`、`POOL EDGES PASS`）。五个定向变异均被捕获并恢复。真实 stdio 测试覆盖 PID 复用、命名空间隔离、资源/指令绑定、工具变更通知、重连与握手未完成时的卸载；registry 使用测试替身。当前 DSH host 未重启，真实 Web UI 与用户 server 的实机性能仍待确认。
 
 ## 未来扩展（本期不做）
 
 - workspaceRegistry 事件（给 dsh 提 PR，消除周期重扫）
 - preset 卡片发现 agent 自有工作区工具（候选：观察 live agent 的 tools/change 并持久化已见 mcp__<server>__* 名单；经 cordis 插件注册表枚举 mcp-client fiber；DSH 宿主级特性/上游提案；未选定）
 - 自有作用域工具的 preset 级隐藏（需 dsh 核心支持 restrict 覆盖自有/后注册名称，ADR-0001 H1）
-- Resources / Prompts 桥接（mcp-client 本身未实现）
+- MCP Prompts 桥接（不影响本期既有 resources 与 server instructions 的 agent 作用域绑定）
 - 非工作区来源 MCP 的写回管理（移除/编辑 profile patch 条目）
 - CLI 管理命令（`dsh mcp` 子命令）
 
