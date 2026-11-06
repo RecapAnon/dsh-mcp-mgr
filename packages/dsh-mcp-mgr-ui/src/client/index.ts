@@ -1,5 +1,5 @@
 /**
- * MCP manager tab registered into Web Settings.
+ * MCP manager page: a sidebar panel row plus its main-panel page.
  */
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
@@ -9,27 +9,31 @@ import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import { TYPERT_REMOTE } from 'dsh-mcp-mgr/remote'
 import type { McpApplyResult, McpManagerSnapshot, McpPluginVersionInfo, McpServerDraft } from 'dsh-mcp-mgr/types'
-import { McpSettingsTab, type McpSettingsTabInjected } from './McpSettingsTab.tsx'
+import { McpPage, McpPanelIcon, type McpPageInjected } from './McpPage.tsx'
 import { en, zh, type McpLocaleKey } from './locales.ts'
 
-export type { McpSettingsTabInjected, McpSettingsTabProps } from './McpSettingsTab.tsx'
+export type { McpPageInjected, McpPageProps } from './McpPage.tsx'
 export type { McpLocaleKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** MCP manager copy. */
-    'settings.mcpMgr': McpLocaleKey
+    'mcpMgr': McpLocaleKey
   }
 }
 
 /** Dictionary namespace owned by this plugin. */
-export const NS = 'settings.mcpMgr'
+export const NS = 'mcpMgr'
 
-/** Services required by the Settings registration. */
+/** Sidebar row id and main-panel key; the two must match. */
+const PANEL_ID = 'mcp-mgr' as MainPanelId
+
+/** Services required by the page registration. */
 export const inject = ['slots', 'locale', 'remote', 'sessions', 'workspaces']
 
 /** The namespace service this plugin mounts itself — fetched via `ctx.get`, never injected. */
@@ -45,10 +49,9 @@ interface McpMgrNamespace {
 }
 
 /**
- * Mount the mcpMgr Remote contribution and register the tab into the
- * Plugins settings section.
+ * Mount the mcpMgr Remote contribution and register the sidebar page.
  *
- * The mount is awaited in `apply` (the api-remotes pattern) so the tab is
+ * The mount is awaited in `apply` (the api-remotes pattern) so the page is
  * only registered after the namespace service exists. The namespace is not
  * injected: this plugin provides it itself, and injecting a self-provided
  * service deadlocks the fiber (pending forever). Consumers read it through
@@ -72,7 +75,7 @@ export async function apply(ctx: ClientContext): Promise<void> {
   const currentSession = () => Object.values(ctx.sessions.list.getSnapshot().byId)
     .find(row => (row.retainedBy.mainView ?? 0) > 0)?.id
 
-  const injected = (): McpSettingsTabInjected => ({
+  const injected = (): McpPageInjected => ({
     snapshot: async () => {
       const result = await mcpMgr().snapshot()
       if (!result.ok) {
@@ -141,12 +144,17 @@ export async function apply(ctx: ClientContext): Promise<void> {
     },
   })
 
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab',
-    id: 'mcpMgr',
+  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+    name: 'sidebar.panellist',
+    id: PANEL_ID,
     order: 20,
-    label: () => t('tab'),
+    label: () => t('panel'),
+    locale: NS,
+  }, McpPanelIcon))
+  ctx.slots.inject('main', () => ctx.slots.register({
+    name: 'main',
+    key: PANEL_ID,
     locale: NS,
     inject: injected,
-  }, McpSettingsTab))
+  }, McpPage))
 }

@@ -50,7 +50,7 @@ Set-Location $env:DSH_HARNESS_ROOT
 pnpm dsh web
 ```
 
-去到设置 > 插件，检查 MCP 服务页签是否正常工作。
+点击左侧栏 **MCP** 入口，检查 MCP 服务页面是否正常工作。
 
 ## 4. 本地回归
 

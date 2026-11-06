@@ -12,9 +12,9 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 plugin --profile web add dsh-mcp-mgr@0.3.0
 
 ---
 
-A workspace-level MCP manager for DeepSeek Harness: it reads MCP servers from each workspace's `.dsh/dshmm/mcp.json`, registers their tools dynamically, and provides a management tab in the Web settings UI.
+A workspace-level MCP manager for DeepSeek Harness: it reads MCP servers from each workspace's `.dsh/dshmm/mcp.json`, registers their tools dynamically, and provides a management page in the Web UI, opened from the **MCP** row in the left sidebar.
 
-![MCP servers tab](Doc/assets/plugin-shot.jpg)
+![MCP servers page](Doc/assets/plugin-shot.jpg)
 
 ## Choose your workflow
 
@@ -86,8 +86,8 @@ Rules:
 - mcp.json changes: removing or disabling a server stops its backends and removes its bindings. Transport configuration or scope changes replace the affected backend; `excludeTools` changes update agent bindings only, without restarting the process.
 - Every agent of a workspace gets all its enabled, non-conflict servers; there is no per-preset filtering.
 - Compatibility: requires `dsh-preset-tool-access` **>= 0.2.1** (earlier versions' `restrict` throws on agent-scoped tool names and drops their denials).
-- Settings shows per workspace server: config status (`configured` / `disabled` / `conflict` / `error`), running agents, connected agents (tools visible), and the last error.
-- Profile-level servers (mcp-client rows from bundles or the profile `cordis.patch.yml`) can be disabled and re-enabled in Settings. The change goes through the host plugin manager, which writes a `disabled` override into the profile `cordis.patch.yml` and applies it live to every session. Rows the plugin manager cannot address (inside a group, duplicate id) report why.
+- The MCP page shows per workspace server: config status (`configured` / `disabled` / `conflict` / `error`), running agents, connected agents (tools visible), and the last error.
+- Profile-level servers (mcp-client rows from bundles or the profile `cordis.patch.yml`) can be disabled and re-enabled on the MCP page. The change goes through the host plugin manager, which writes a `disabled` override into the profile `cordis.patch.yml` and applies it live to every session. Rows the plugin manager cannot address (inside a group, duplicate id) report why.
 - Per-tool selection: each row's **Tools** button lists the server's tools with a checkbox each. Workspace servers save to `excludeTools` in mcp.json and update agent bindings without a backend restart; their list appears after tool discovery. Profile-level servers save to `<profileDir>/dshmm/tools.json` (`{ "excludeTools": { "<serverName>": ["<tool>"] } }`, hand-editable) and are hidden per agent with `tools.restrict` at its next turn; unloading this plugin lifts those restrictions.
 - On Windows, prefer launching stdio servers with `node` directly: teardown kills only the direct child, so `cmd /c npx …` wrappers can leave orphaned processes.
 

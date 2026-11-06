@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import type { McpServerState } from 'dsh-mcp-mgr/types'
 import type { McpLocaleKey } from './locales.ts'
-import css from './McpSettingsTab.module.css'
+import css from './McpPage.module.css'
 
 export interface ToolPickerProps {
   readonly server: McpServerState

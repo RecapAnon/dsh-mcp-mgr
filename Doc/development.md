@@ -50,7 +50,7 @@ Set-Location $env:DSH_HARNESS_ROOT
 pnpm dsh web
 ```
 
-Go to Settings > Plugins and check the MCP server tab.
+Open the **MCP** row in the left sidebar and check the MCP servers page.
 
 ## 4. Local regression
 

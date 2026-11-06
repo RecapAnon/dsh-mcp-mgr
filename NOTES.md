@@ -24,6 +24,7 @@
 - `liveAgents` = 持有该 server 绑定的 agent 数（含连接中），不是后端进程数；`connectedAgents` = `tools.schemas(agent)` 含 `mcp__<name>__*` 的 agent 数，快照时每 agent 计算一次；共享后端可在两者为零时仍运行
 - `lastError`：该 server 最近一次后端启动失败；成功、server 移除或工作区移除时清除
 - 刷新按钮只重新拉取快照
+- UI 入口：`sidebar.panellist` 行 + `main` keyed 页面（id/key 均为 `mcp-mgr`，必须一致）；已不再注册设置页 `settings.plugins.tab`。类型来自 `dsh-client-ui-layout` / `dsh-client-ui-sidebar`（devDeps）
 
 ## 排查教训
 

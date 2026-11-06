@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-mgr-ui",
-  "description": "Web UI plugin for dsh-mcp-mgr: MCP management tab in dsh settings",
+  "description": "Web UI plugin for dsh-mcp-mgr: MCP management page in the dsh sidebar",
   "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
@@ -25,8 +25,8 @@
         "@deepseek-ai/dsh-api-workspace-controller",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-renderer",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins"
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
       ],
       "platform": "web"
     }
@@ -46,8 +46,8 @@
     "@deepseek-ai/dsh-client-ui-primitives": ">=0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-renderer": ">=0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-session": ">=0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings": ">=0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": ">=0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-layout": ">=0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-sidebar": ">=0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-slots": ">=0.2.0-rc.2",
     "@deepseek-ai/cordis": ">=4.0.4",
     "react": "^18.2.0"

@@ -1,8 +1,10 @@
-/** Copy dictionaries for the MCP manager Settings tab. */
+/** Copy dictionaries for the MCP manager page. */
 
 /** Simplified Chinese dictionary and key source of truth. */
 export const zh = {
-  tab: 'MCP 服务',
+  panel: 'MCP',
+  title: 'MCP 服务',
+  intro: '工作区 .dsh/dshmm/mcp.json 与 profile 中声明的 MCP 服务：状态、启停、工具选择与新增。',
   loading: '正在读取 MCP 服务…',
   error: '暂时无法读取 MCP 服务。',
   retry: '重试',
@@ -73,7 +75,9 @@ export type McpLocaleKey = keyof typeof zh
 
 /** English dictionary checked against the Chinese key set. */
 export const en: Record<McpLocaleKey, string> = {
-  tab: 'MCP servers',
+  panel: 'MCP',
+  title: 'MCP servers',
+  intro: 'MCP servers declared in workspace .dsh/dshmm/mcp.json files and the profile: status, enable/disable, tool selection, and adding new ones.',
   loading: 'Loading MCP servers…',
   error: 'Unable to load MCP servers.',
   retry: 'Retry',

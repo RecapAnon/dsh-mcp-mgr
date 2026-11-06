@@ -1,7 +1,51 @@
+/* Main-panel frame: the host gives no scroll container, so the page owns it. */
+.page {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-base);
+  font-size: 14px;
+}
+
+.pageScroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+/* Same centered 960px column and insets as the host's first-level pages. */
 .section {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 28px clamp(24px, 4vw, 48px) 48px;
+}
+
+:global([data-platform='darwin']) .section {
+  padding-top: calc(28px + var(--dsh-frame-top-clearance, 0px));
+}
+
+.heading h1 {
+  min-width: 0;
+  margin: 0;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 500;
+}
+
+.intro {
+  margin: 0 0 12px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 20px;
 }
 
 /* New-version banner: soft accent strip above the table. */
@@ -82,12 +126,23 @@
   overflow: hidden;
 }
 
-.table th:nth-child(1) { width: 20%; }
-.table th:nth-child(2) { width: 15%; }
-.table th:nth-child(3) { width: 12%; }
-.table th:nth-child(4) { width: 18%; }
-.table th:nth-child(5) { width: 15%; }
-.table th:nth-child(6) { width: 20%; }
+.table th:nth-child(1) { width: 18%; }
+.table th:nth-child(2) { width: 16%; }
+.table th:nth-child(3) { width: 9%; }
+.table th:nth-child(4) { width: 12%; }
+.table th:nth-child(5) { width: 17%; }
+.table th:nth-child(6) { width: 28%; }
+
+/* Action buttons wrap onto a second line rather than clip at narrow widths. */
+.actionCell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.actionCell .toggle {
+  margin-right: 0;
+}
 
 /* Profile-sourced rows get a subtle tint to tell them apart (workspace = plain). */
 .table tr[data-source='profile'] td {

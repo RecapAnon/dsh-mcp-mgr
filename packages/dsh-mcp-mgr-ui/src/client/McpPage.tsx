@@ -5,7 +5,7 @@ import { Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import { McpServerForm } from './McpServerForm.tsx'
 import { ToolPicker } from './ToolPicker.tsx'
 import type { McpLocaleKey } from './locales.ts'
-import css from './McpSettingsTab.module.css'
+import css from './McpPage.module.css'
 
 /** One workspace row the add-form may target. */
 export interface WorkspaceOption {
@@ -13,8 +13,8 @@ export interface WorkspaceOption {
   readonly title: string
 }
 
-/** Registration-side Remote face used by the tab. */
-export interface McpSettingsTabInjected {
+/** Registration-side Remote face used by the page. */
+export interface McpPageInjected {
   /** Read a current manager snapshot. */
   snapshot: () => Promise<McpManagerSnapshot>
   /** Create one server entry in a workspace's mcp.json. */
@@ -37,11 +37,11 @@ export interface McpSettingsTabInjected {
   currentWorkspacePath: () => string
 }
 
-/** Full component props assembled by the Settings slot renderer. */
-export type McpSettingsTabProps =
-  PropsRuntime<'settings.plugins.tab'>
-  & PropsLocale<'settings.mcpMgr'>
-  & InjectFace<McpSettingsTabInjected>
+/** Full component props assembled by the main-panel slot renderer. */
+export type McpPageProps =
+  PropsRuntime<'main'>
+  & PropsLocale<'mcpMgr'>
+  & InjectFace<McpPageInjected>
 
 type ViewState =
   | { readonly status: 'loading' }
@@ -68,11 +68,21 @@ function shortPath(path: string, forceLastTwo = false): string {
   return parts.slice(-count).join('/')
 }
 
-/** Render the currently registered MCP servers (workspace + profile sources). */
-export function McpSettingsTab({
+/** Sidebar row glyph: a two-prong plug, drawn in currentColor at the requested edge. */
+export function McpPanelIcon({ size }: PropsRuntime<'sidebar.panellist'>): ReactNode {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M9 3v4M15 3v4M6 7h12v3a6 6 0 0 1-12 0V7ZM12 16v5" />
+    </svg>
+  )
+}
+
+/** Main-panel page listing the registered MCP servers (workspace + profile sources). */
+export function McpPage({
   snapshot, apply, removeServer, setServerEnabled, setProfileServerEnabled, setServerTools, setProfileServerTools,
   versionInfo, listWorkspaces, currentWorkspacePath, t,
-}: McpSettingsTabProps): ReactNode {
+}: McpPageProps): ReactNode {
   const [request, setRequest] = useState(0)
   const [state, setState] = useState<ViewState>({ status: 'loading' })
   const [errorDetail, setErrorDetail] = useState<string | null>(null)
@@ -202,21 +212,13 @@ export function McpSettingsTab({
   }
 
   return (
+    <div className={css.page}>
+    <div className={css.pageScroll}>
     <div className={css.section} aria-busy={state.status === 'loading'}>
       {/* Transient result feedback: floats over the viewport, never pushes the table. */}
       {notice !== null ? <Toast text={notice} onDone={() => { setNotice(null) }} /> : null}
-      {/* Startup npm update check: banner only when an upgrade is available. */}
-      {updateInfo?.updateAvailable === true ? (
-        <div className={css.update} role="status">
-          {t('updateAvailable')}
-          {' '}
-          <a href={updateInfo.updateUrl} target="_blank" rel="noreferrer">{updateInfo.updateUrl}</a>
-          {' '}
-          {t('updateAvailableLink')}
-        </div>
-      ) : null}
       <div className={css.heading}>
-        <h3>{t('server')}</h3>
+        <h1>{t('title')}</h1>
         <div className={css.headingActions}>
           <button
             type="button"
@@ -230,6 +232,17 @@ export function McpSettingsTab({
           <button type="button" className={css.refresh} onClick={retry}>{t('refresh')}</button>
         </div>
       </div>
+      <p className={css.intro}>{t('intro')}</p>
+      {/* Startup npm update check: banner only when an upgrade is available. */}
+      {updateInfo?.updateAvailable === true ? (
+        <div className={css.update} role="status">
+          {t('updateAvailable')}
+          {' '}
+          <a href={updateInfo.updateUrl} target="_blank" rel="noreferrer">{updateInfo.updateUrl}</a>
+          {' '}
+          {t('updateAvailableLink')}
+        </div>
+      ) : null}
       {showForm ? (
         <McpServerForm
           workspaces={listWorkspaces()}
@@ -308,7 +321,8 @@ export function McpSettingsTab({
                       </span>
                     ) : null}
                   </td>
-                  <td className={css.nowrapCell}>
+                  <td>
+                    <div className={css.actionCell}>
                     {toolsButton}
                     {server.source === 'workspace' ? (
                       <>
@@ -340,6 +354,7 @@ export function McpSettingsTab({
                         {server.enabled === false ? t('enable') : t('disable')}
                       </button>
                     ) : null}
+                    </div>
                   </td>
                 </tr>
                 {toolsOpen === server.key ? (
@@ -361,6 +376,8 @@ export function McpSettingsTab({
           </tbody>
         </table>
       ) : null}
+    </div>
+    </div>
     </div>
   )
 }

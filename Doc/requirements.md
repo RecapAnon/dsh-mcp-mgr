@@ -18,7 +18,7 @@ packages/dsh-mcp-mgr/      组1 host 插件（已实现 + 验证）
   src/{index,parse,mounts,discovery,profile,watch,version,types}.ts
   lib/typert.{host,remote-client}.js    Remote 产物（mcpMgr: snapshot/apply/remove）
 packages/dsh-mcp-mgr-ui/   组2 client 插件（已实现 + 构建）
-  src/{index.ts, client/{index.ts,McpSettingsTab.tsx,locales.ts}}
+  src/{index.ts, client/{index.ts,McpPage.tsx,locales.ts}}
   lib/client.js            浏览器 bundle（__ModuleLoader__ closure，145KB）
 packages/vendor-typert-protocol/   vendored protocol 源码（S1 约束）
 packages/{platform,tsdown.client}.ts   client 构建基础设施（从 dsh 复刻）
